@@ -776,6 +776,16 @@ void setup()
     nodeDB = new NodeDB;
 
 #if HAS_TFT
+    // One-time auto-migration: a TFT build with no explicit display-mode choice
+    // (NVS preserved from a non-TFT firmware, or otherwise still at the proto
+    // default sentinel) gets bumped to COLOR so the standalone UI comes up.
+    // installDefaultConfig() already does this for fresh NVS; this handles the
+    // upgrade path where NVS is non-empty but predates HAS_TFT.
+    if (config.display.displaymode == meshtastic_Config_DisplayConfig_DisplayMode_DEFAULT) {
+        config.display.displaymode = meshtastic_Config_DisplayConfig_DisplayMode_COLOR;
+        nodeDB->saveToDisk(SEGMENT_CONFIG);
+        LOG_INFO("HAS_TFT: migrated display.displaymode DEFAULT -> COLOR");
+    }
     if (config.display.displaymode == meshtastic_Config_DisplayConfig_DisplayMode_COLOR) {
         tftSetup();
     }
