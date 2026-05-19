@@ -65,10 +65,24 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     // Returns false if a recording or TX is already in progress.
     bool startRecording(uint32_t duration_ms, NodeNum to = NODENUM_BROADCAST);
 
-    // Stop the current recording early; the captured-so-far audio is still sent.
+    // Stop the current recording early. After stop, the captured audio is
+    // *held* (not auto-sent) until sendPending() or discardPending() is called.
     void stopRecording();
 
     bool isRecording() const { return recording.load(std::memory_order_acquire); }
+
+    // True when there's a captured-but-unsent audio buffer waiting to be sent.
+    bool hasPending() const { return pending_audio_size.load(std::memory_order_acquire) > 0; }
+
+    // Send the held audio to the chosen destination. Returns false if there's
+    // no held audio or TX is already in progress.
+    bool sendPending(NodeNum to, uint8_t channel = 0);
+
+    // Throw away the held audio (user cancelled).
+    void discardPending();
+
+    // Milliseconds since the active recording started, or 0 if not recording.
+    uint32_t recordElapsedMs() const;
 
   protected:
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
@@ -96,9 +110,14 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     std::atomic<bool>     rec_stop_requested{false}; // loop task asks task to bail early
     std::atomic<bool>     rec_audio_ready{false};  // task has placed audio in rec_audio_done
     uint32_t              rec_duration_ms = 0;     // set by loop task before kicking the task
-    NodeNum               rec_to_pending = NODENUM_BROADCAST;
+    uint32_t              rec_started_ms = 0;      // millis() the task entered RECORDING; for elapsedMs()
     std::vector<uint8_t>  rec_audio_done;          // filled by codec2 task; consumed by loop task
-    concurrency::Lock     rec_audio_lock;          // protects rec_audio_done across the hand-off
+    concurrency::Lock     rec_audio_lock;          // protects rec_audio_done and pending_audio
+
+    // "Armed" audio: captured but not yet sent. The chat screen sends it
+    // explicitly via sendPending() once the user presses ENTER.
+    std::vector<uint8_t>  pending_audio;
+    std::atomic<size_t>   pending_audio_size{0};   // also used as hasPending() flag
 
     TaskHandle_t          codec2_task = nullptr;
 

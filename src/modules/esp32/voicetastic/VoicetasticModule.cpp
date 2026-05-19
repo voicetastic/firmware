@@ -124,13 +124,56 @@ bool VoicetasticModule::startRecording(uint32_t duration_ms, NodeNum to)
         return false;
     }
 
+    (void)to; // Destination is decided at sendPending() time, not at start time.
+    // Discard any previously held audio: starting a new recording supersedes it.
+    if (pending_audio_size.load(std::memory_order_acquire) > 0) {
+        discardPending();
+    }
+
     rec_duration_ms = duration_ms;
-    rec_to_pending  = to;
     rec_stop_requested.store(false, std::memory_order_release);
-    // Notify the task; it picks up duration/to and goes to work.
+    // Notify the task; it picks up duration and goes to work.
     xTaskNotifyGive(codec2_task);
     LOG_INFO("Voicetastic: recording requested (%u ms)", (unsigned)duration_ms);
     return true;
+}
+
+uint32_t VoicetasticModule::recordElapsedMs() const
+{
+    if (!recording.load(std::memory_order_acquire)) return 0;
+    const uint32_t started = rec_started_ms;
+    if (started == 0) return 0;
+    return millis() - started;
+}
+
+bool VoicetasticModule::sendPending(NodeNum to, uint8_t /*channel*/)
+{
+    using namespace voicetastic;
+    const size_t sz = pending_audio_size.load(std::memory_order_acquire);
+    if (sz == 0) return false;
+    if (tx_active) { LOG_WARN("Voicetastic: TX busy; cannot send pending audio yet"); return false; }
+
+    std::vector<uint8_t> audio;
+    {
+        concurrency::LockGuard guard(&rec_audio_lock);
+        audio = std::move(pending_audio);
+        pending_audio.clear();
+    }
+    pending_audio_size.store(0, std::memory_order_release);
+
+    if (audio.empty()) return false;
+    return enqueueOutbound(audio.data(), audio.size(),
+                           CodecId::CODEC2, (uint8_t)Codec2Mode::M_1200, to);
+}
+
+void VoicetasticModule::discardPending()
+{
+    {
+        concurrency::LockGuard guard(&rec_audio_lock);
+        pending_audio.clear();
+        pending_audio.shrink_to_fit();
+    }
+    pending_audio_size.store(0, std::memory_order_release);
 }
 
 void VoicetasticModule::stopRecording()
@@ -178,6 +221,7 @@ void VoicetasticModule::codec2TaskBody()
         std::vector<uint8_t> audio;
         audio.reserve((size_t)(duration_ms / 1000 + 1) * 150 + 32);
 
+        rec_started_ms = start_ms;
         recording.store(true, std::memory_order_release);
         LOG_INFO("Voicetastic: recording started (%u ms)", (unsigned)duration_ms);
 
@@ -209,19 +253,18 @@ void VoicetasticModule::codec2TaskBody()
 
 void VoicetasticModule::finishRecordingHandoff(uint32_t /*now*/)
 {
-    using namespace voicetastic;
+    // Move the captured audio from the codec2 task's hand-off slot into the
+    // "held" buffer. The chat screen now decides if/when to actually send it.
     std::vector<uint8_t> audio;
-    NodeNum to;
     {
         concurrency::LockGuard guard(&rec_audio_lock);
         audio = std::move(rec_audio_done);
+        pending_audio = std::move(audio);
     }
-    to = rec_to_pending;
+    pending_audio_size.store(pending_audio.size(), std::memory_order_release);
     rec_audio_ready.store(false, std::memory_order_release);
-
-    if (audio.empty()) return;
-    enqueueOutbound(audio.data(), audio.size(),
-                    CodecId::CODEC2, (uint8_t)Codec2Mode::M_1200, to);
+    LOG_INFO("Voicetastic: %u bytes captured; awaiting send",
+             (unsigned)pending_audio_size.load(std::memory_order_acquire));
 }
 
 void VoicetasticModule::sendOneChunk()
