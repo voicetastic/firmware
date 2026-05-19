@@ -70,8 +70,11 @@ VoicetasticModule::VoicetasticModule()
 
     // Spin up the dedicated codec2 / capture task with an 8 KB stack.
     // Priority 3 matches AudioModule's codec2HandlerTask convention.
+    // Priority 2 (below LVGL/main but above idle) so the codec2 task can't
+    // starve the UI thread. 8 KB stack covers codec2_encode's frame-internal
+    // arrays + i2s_read scratch comfortably.
     const BaseType_t rc = xTaskCreate(&VoicetasticModule::codec2TaskTrampoline,
-                                      "vtCodec2", 8192, this, 3, &codec2_task);
+                                      "vtCodec2", 8192, this, 2, &codec2_task);
     if (rc != pdPASS) {
         codec2_task = nullptr;
         LOG_ERROR("Voicetastic: failed to create codec2 task (rc=%d)", (int)rc);
@@ -225,13 +228,24 @@ void VoicetasticModule::codec2TaskBody()
         recording.store(true, std::memory_order_release);
         LOG_INFO("Voicetastic: recording started (%u ms)", (unsigned)duration_ms);
 
+        uint32_t frame_count = 0;
         while (!rec_stop_requested.load(std::memory_order_acquire) &&
                (millis() - start_ms) < duration_ms) {
             const size_t got = VtAudio::readPcm(pcm, samples_per_frame, 50);
             if ((int)got >= samples_per_frame) {
                 VtAudio::encodeFrame(pcm, bits);
                 audio.insert(audio.end(), bits, bits + bytes_per_frame);
+                frame_count++;
+                if ((frame_count % 25) == 0) {
+                    // ~1 s heartbeat at Codec2 1200 (25 frames * 40 ms).
+                    LOG_DEBUG("Voicetastic: %u frames captured (%u bytes)",
+                              (unsigned)frame_count, (unsigned)audio.size());
+                }
             }
+            // Guarantee a yield so the FreeRTOS idle task gets to run; without
+            // this, codec2_encode in a tight loop can starve the system watchdog
+            // and trigger a reboot.
+            vTaskDelay(1);
         }
 
         // NOTE: do NOT call VtAudio::deinitEncoder() / deinitMic() between
