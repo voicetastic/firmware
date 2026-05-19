@@ -206,6 +206,35 @@ void VoicetasticModule::codec2TaskBody()
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
+#ifdef VOICETASTIC_DRY_RUN
+        // Dry-run mode: pretend to record for the requested duration without
+        // touching the ES7210, I2C, or codec2_encode. Used to isolate whether
+        // a reboot during recording is from the audio path or from elsewhere
+        // (UI, task lifecycle, hand-off). Sleeps 40 ms per "frame" and logs a
+        // heartbeat every ~1 s, just like the real path.
+        const int samples_per_frame_dry = 320;  // mode 1200 nominal
+        const int bytes_per_frame_dry   = 6;
+        const uint32_t duration_ms  = rec_duration_ms;
+        const uint32_t start_ms     = millis();
+        std::vector<uint8_t> audio;
+        audio.reserve(1024);
+        rec_started_ms = start_ms;
+        recording.store(true, std::memory_order_release);
+        LOG_INFO("Voicetastic: DRY-RUN recording started (%u ms)", (unsigned)duration_ms);
+        uint32_t frame_count = 0;
+        (void)samples_per_frame_dry; (void)pcm; (void)bits;
+        while (!rec_stop_requested.load(std::memory_order_acquire) &&
+               (millis() - start_ms) < duration_ms) {
+            // Append 6 bytes of zeros to simulate a Codec2 1200 frame.
+            for (int b = 0; b < bytes_per_frame_dry; b++) audio.push_back(0);
+            frame_count++;
+            if ((frame_count % 25) == 0) {
+                LOG_DEBUG("Voicetastic: DRY-RUN %u frames (%u bytes)",
+                          (unsigned)frame_count, (unsigned)audio.size());
+            }
+            vTaskDelay(pdMS_TO_TICKS(40)); // mimic real frame cadence
+        }
+#else
         if (!VtAudio::initMic()) {
             LOG_ERROR("Voicetastic: mic init failed");
             continue;
@@ -247,6 +276,7 @@ void VoicetasticModule::codec2TaskBody()
             // and trigger a reboot.
             vTaskDelay(1);
         }
+#endif
 
         // NOTE: do NOT call VtAudio::deinitEncoder() / deinitMic() between
         // recordings. The ES7210 deinit path writes back over I2C while the
