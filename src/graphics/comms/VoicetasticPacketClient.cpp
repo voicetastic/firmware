@@ -50,4 +50,61 @@ uint32_t VoicetasticPacketClient::voiceRecordElapsedMs() const
     return voicetasticModule->recordElapsedMs();
 }
 
+// ---------- Mini-player ----------
+
+size_t VoicetasticPacketClient::voicePlayPendingCount() const
+{
+    if (voicetasticModule == nullptr) return 0;
+    return voicetasticModule->pendingPlayCount();
+}
+
+bool VoicetasticPacketClient::voicePlayNext()
+{
+    if (voicetasticModule == nullptr) return false;
+    return voicetasticModule->playNextPending();
+}
+
+void VoicetasticPacketClient::voicePlayStop()
+{
+    if (voicetasticModule == nullptr) return;
+    voicetasticModule->stopPlayback();
+}
+
+bool VoicetasticPacketClient::voicePlayIsPlaying() const
+{
+    if (voicetasticModule == nullptr) return false;
+    return voicetasticModule->isPlaying();
+}
+
+uint32_t VoicetasticPacketClient::voicePlayElapsedMs() const
+{
+    if (voicetasticModule == nullptr) return 0;
+    return voicetasticModule->playbackElapsedMs();
+}
+
+uint32_t VoicetasticPacketClient::voicePlayTotalMs() const
+{
+    if (voicetasticModule == nullptr) return 0;
+    return voicetasticModule->playbackTotalMs();
+}
+
+uint32_t VoicetasticPacketClient::voicePlayFromNode() const
+{
+    if (voicetasticModule == nullptr) return 0;
+    return (uint32_t)voicetasticModule->playbackFromNode();
+}
+
+bool VoicetasticPacketClient::voicePlayPeek(size_t index, uint32_t &from, uint32_t &message_id,
+                                            uint32_t &approx_duration_ms) const
+{
+    if (voicetasticModule == nullptr) {
+        from = 0; message_id = 0; approx_duration_ms = 0;
+        return false;
+    }
+    NodeNum nn = 0;
+    const bool ok = voicetasticModule->peekPending(index, nn, message_id, approx_duration_ms);
+    from = (uint32_t)nn;
+    return ok;
+}
+
 #endif // ARCH_ESP32 && !MESHTASTIC_EXCLUDE_VOICETASTIC && HAS_TFT

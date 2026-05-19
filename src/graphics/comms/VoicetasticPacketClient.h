@@ -22,6 +22,17 @@ class VoicetasticPacketClient : public PacketClient
     VoiceState voiceRecordState() const override;
     uint32_t  voiceRecordElapsedMs() const override;
 
+    // Mini-player.
+    size_t    voicePlayPendingCount() const override;
+    bool      voicePlayNext() override;
+    void      voicePlayStop() override;
+    bool      voicePlayIsPlaying() const override;
+    uint32_t  voicePlayElapsedMs() const override;
+    uint32_t  voicePlayTotalMs() const override;
+    uint32_t  voicePlayFromNode() const override;
+    bool      voicePlayPeek(size_t index, uint32_t &from, uint32_t &message_id,
+                            uint32_t &approx_duration_ms) const override;
+
   private:
     // The chat screen calls voiceRecordStart() with the currently-selected
     // peer/channel; we cache them so voiceRecordSend() knows where to send.

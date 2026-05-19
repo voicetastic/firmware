@@ -85,6 +85,20 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     voicetastic::Codec2Mode getCodec2Mode() const { return codec2_mode; }
     void setCodec2Mode(voicetastic::Codec2Mode mode) { codec2_mode = mode; }
 
+    // Mini-player API. Received voice messages no longer auto-play; instead
+    // they accumulate in pending_play_queue and the chat-screen widget drives
+    // playback explicitly via these calls.
+    size_t   pendingPlayCount() const { return pending_play_queue.size(); }
+    bool     playNextPending();              // start playing the oldest queued message
+    void     stopPlayback();                 // interrupt current playback (worker exits early)
+    bool     isPlaying() const { return playing; }
+    uint32_t playbackElapsedMs() const;      // 0 when not playing
+    uint32_t playbackTotalMs() const { return play_total_ms; }
+    NodeNum  playbackFromNode() const { return play_from_node; }
+    // Inspect a queued message without consuming it.
+    bool     peekPending(size_t index, NodeNum &from, uint32_t &message_id,
+                         uint32_t &approx_duration_ms) const;
+
     // True when there's a captured-but-unsent audio buffer waiting to be sent.
     bool hasPending() const { return !pending_audio.empty(); }
 
@@ -157,14 +171,22 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     static void encoderTaskTrampoline(void *self);
     void encoderTaskBody();
 
-    // Playback (Phase 6). Spawned by runOnce when the assembler has a
-    // complete message and we're otherwise idle. Worker tears down the mic,
-    // brings the DAC up, decodes codec2 frame-by-frame, writes PCM to I2S,
-    // tears the DAC back down and re-inits the mic on exit.
+    // Playback (Phase 6). Started explicitly by playNextPending() in response
+    // to a chat-screen mini-player click. Worker tears down the mic, brings
+    // the DAC up, decodes codec2 frame-by-frame, writes PCM to I2S, tears the
+    // DAC back down and re-inits the mic on exit.
     bool                  playing = false;
     volatile bool         playback_done = false;
+    volatile bool         playback_stop_requested = false;
     TaskHandle_t          playback_task = nullptr;
     voicetastic::ReceivedVoiceMessage playback_msg;
+    uint32_t              play_started_ms = 0;   // millis() when worker started writing PCM
+    uint32_t              play_total_ms = 0;     // duration of currently-playing or queued-front message
+    NodeNum               play_from_node = 0;
+
+    // Mini-player queue: received messages we have NOT auto-played, waiting
+    // for the chat screen to drive them.
+    std::vector<voicetastic::ReceivedVoiceMessage> pending_play_queue;
 
     static void playbackTaskTrampoline(void *self);
     void playbackTaskBody();

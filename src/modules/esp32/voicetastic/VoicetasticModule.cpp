@@ -249,6 +249,34 @@ void VoicetasticModule::encoderTaskTrampoline(void *self)
     static_cast<VoicetasticModule *>(self)->encoderTaskBody();
 }
 
+// Look up Codec2 mode's bytes/frame + samples/frame without touching the
+// encoder/decoder instances (used to estimate playback duration before
+// allocating the worker task).
+static void vtCodec2FrameInfo(voicetastic::Codec2Mode mode, int &bytes_per_frame,
+                              int &samples_per_frame)
+{
+    using namespace voicetastic;
+    switch (mode) {
+    case Codec2Mode::M_3200: bytes_per_frame = 8; samples_per_frame = 160; break;
+    case Codec2Mode::M_2400: bytes_per_frame = 6; samples_per_frame = 160; break;
+    case Codec2Mode::M_1600: bytes_per_frame = 8; samples_per_frame = 320; break;
+    case Codec2Mode::M_1400: bytes_per_frame = 7; samples_per_frame = 320; break;
+    case Codec2Mode::M_1300: bytes_per_frame = 7; samples_per_frame = 320; break;
+    case Codec2Mode::M_1200: bytes_per_frame = 6; samples_per_frame = 320; break;
+    default: bytes_per_frame = 6; samples_per_frame = 320; break;
+    }
+}
+
+static uint32_t vtEstimateDurationMs(const voicetastic::ReceivedVoiceMessage &msg)
+{
+    int bpf = 6, spf = 320;
+    if (msg.codec == voicetastic::CodecId::CODEC2)
+        vtCodec2FrameInfo((voicetastic::Codec2Mode)msg.codec_param, bpf, spf);
+    if (bpf == 0) return 0;
+    const uint32_t frames = (uint32_t)(msg.audio.size() / (size_t)bpf);
+    return (frames * (uint32_t)spf) / 8; // samples_per_frame * 1000 / 8000 simplified
+}
+
 bool VoicetasticModule::startPlayback(const voicetastic::ReceivedVoiceMessage &msg)
 {
     using namespace voicetastic;
@@ -258,6 +286,10 @@ bool VoicetasticModule::startPlayback(const voicetastic::ReceivedVoiceMessage &m
 
     playback_msg = msg; // copy in (vector copy)
     playback_done = false;
+    playback_stop_requested = false;
+    play_from_node = msg.from;
+    play_total_ms = vtEstimateDurationMs(msg);
+    play_started_ms = 0; // worker stamps this when it begins writing PCM
 
     const BaseType_t rc = xTaskCreate(&VoicetasticModule::playbackTaskTrampoline,
                                       "vtPlay", 32768, this, 1, &playback_task);
@@ -265,12 +297,51 @@ bool VoicetasticModule::startPlayback(const voicetastic::ReceivedVoiceMessage &m
         LOG_ERROR("Voicetastic: failed to create playback task (rc=%d)", (int)rc);
         playback_task = nullptr;
         playback_msg.audio.clear();
+        play_total_ms = 0;
+        play_from_node = 0;
         return false;
     }
     playing = true;
-    LOG_INFO("Voicetastic: playback started mid=%08x (%u bytes, codec=%u/%u)",
+    LOG_INFO("Voicetastic: playback started mid=%08x (%u bytes, codec=%u/%u, ~%u ms)",
              (unsigned)msg.message_id, (unsigned)msg.audio.size(),
-             (unsigned)msg.codec, (unsigned)msg.codec_param);
+             (unsigned)msg.codec, (unsigned)msg.codec_param,
+             (unsigned)play_total_ms);
+    return true;
+}
+
+bool VoicetasticModule::playNextPending()
+{
+    if (pending_play_queue.empty()) return false;
+    if (playing) return false;
+    if (rec_state != eRecIdle) return false;
+    if (tx_active) return false;
+    // Move-out the oldest queued message and hand it to the existing playback
+    // worker. The worker self-deletes when done; runOnce observes playback_done.
+    voicetastic::ReceivedVoiceMessage msg = std::move(pending_play_queue.front());
+    pending_play_queue.erase(pending_play_queue.begin());
+    return startPlayback(msg);
+}
+
+void VoicetasticModule::stopPlayback()
+{
+    if (!playing) return;
+    playback_stop_requested = true;
+}
+
+uint32_t VoicetasticModule::playbackElapsedMs() const
+{
+    if (!playing || play_started_ms == 0) return 0;
+    return millis() - play_started_ms;
+}
+
+bool VoicetasticModule::peekPending(size_t index, NodeNum &from, uint32_t &message_id,
+                                    uint32_t &approx_duration_ms) const
+{
+    if (index >= pending_play_queue.size()) return false;
+    const auto &m = pending_play_queue[index];
+    from = m.from;
+    message_id = m.message_id;
+    approx_duration_ms = vtEstimateDurationMs(m);
     return true;
 }
 
@@ -313,7 +384,12 @@ void VoicetasticModule::playbackTaskBody()
     size_t         consumed = 0;
     uint32_t       frame_count = 0;
 
+    play_started_ms = millis();
     while (consumed + bytes_per_frame <= total) {
+        if (playback_stop_requested) {
+            LOG_INFO("vtPlay: stop requested, exiting at frame %u", (unsigned)frame_count);
+            break;
+        }
         VtAudio::decodeFrame(src + consumed, pcm);
         VtAudio::writePcm(pcm, samples_per_frame);
         consumed += bytes_per_frame;
@@ -505,21 +581,26 @@ int32_t VoicetasticModule::runOnce()
     // can't recover them; drop them so they don't leak.)
     assembler.tick(now);
 
-    // Playback lifecycle. If a worker task is running, just wait for it; on
-    // completion, clear state. If idle (no recording, no playback, no TX),
-    // drain the next complete message from the assembler and auto-play it.
+    // Playback lifecycle. If a worker task is running, wait for it; on
+    // completion, clear state. Drain new assembler completions into our own
+    // pending_play_queue but do NOT auto-play -- the chat-screen mini-player
+    // calls playNextPending() explicitly when the user taps play.
     if (playing && playback_done) {
         playing = false;
         playback_done = false;
+        playback_stop_requested = false;
         playback_msg.audio.clear();
         playback_msg.audio.shrink_to_fit();
+        play_total_ms = 0;
+        play_started_ms = 0;
+        play_from_node = 0;
         LOG_INFO("Voicetastic: playback complete");
     }
-    if (!playing && rec_state == eRecIdle && !tx_active) {
-        ReceivedVoiceMessage rxmsg;
-        if (assembler.popComplete(rxmsg)) {
-            startPlayback(rxmsg);
-        }
+    ReceivedVoiceMessage rxmsg;
+    while (assembler.popComplete(rxmsg)) {
+        LOG_INFO("Voicetastic: voice from 0x%08x queued for play (%u bytes)",
+                 (unsigned)rxmsg.from, (unsigned)rxmsg.audio.size());
+        pending_play_queue.push_back(std::move(rxmsg));
     }
 
 #ifdef VOICETASTIC_BOOT_MIC_TEST
