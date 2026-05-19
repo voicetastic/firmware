@@ -99,36 +99,63 @@ bool VoicetasticModule::enqueueOutbound(const uint8_t *audio, size_t audio_len,
     return true;
 }
 
+// Fixed PCM frame size used for on-disk buffering: 320 samples (40 ms at
+// 8 kHz) per frame, 2 bytes/sample = 640 bytes per frame. Matches Codec2's
+// samples_per_frame so the encoding loop reads exactly one frame at a time.
+static constexpr int VT_PCM_SAMPLES_PER_FRAME = 320;
+static constexpr size_t VT_PCM_BYTES_PER_FRAME = VT_PCM_SAMPLES_PER_FRAME * sizeof(int16_t);
+static constexpr const char *VT_PCM_PATH = "/voicetastic.pcm";
+
+// We buffer PCM in LittleFS (the firmware's internal filesystem, mounted at
+// boot via FSCom). Guard returns true as long as FSCom has at least *some*
+// addressable space — i.e. the FS is mounted. If LittleFS failed to mount
+// (rare, would log "FS mount failed" earlier in boot), recording is a no-op.
+static bool vtStorageAvailable()
+{
+    return FSCom.totalBytes() > 0;
+}
+
 bool VoicetasticModule::startRecording(uint32_t duration_ms, NodeNum to)
 {
     using namespace voicetastic;
     (void)to; // Destination is decided at sendPending() time.
-    if (recording) { LOG_WARN("Voicetastic: already recording"); return false; }
+    if (rec_state != eRecIdle) { LOG_WARN("Voicetastic: already recording/encoding"); return false; }
     if (tx_active) { LOG_WARN("Voicetastic: TX in progress; cannot record yet"); return false; }
+
+    // Guard: voice recording needs an SD card mounted (we buffer raw PCM there
+    // to keep codec2_encode out of the loop task during capture). Without one,
+    // SYM+0 is silently a no-op.
+    if (!vtStorageAvailable()) {
+        LOG_WARN("Voicetastic: FSCom storage not mounted; recording disabled");
+        return false;
+    }
+
     if (!pending_audio.empty()) discardPending();
 
     if (!VtAudio::initMic()) {
         LOG_ERROR("Voicetastic: mic init failed");
         return false;
     }
-    if (!VtAudio::initEncoder(Codec2Mode::M_1200)) {
-        LOG_ERROR("Voicetastic: codec2 init failed");
+
+    // Truncate any previous capture and open the PCM file for writing.
+    if (FSCom.exists(VT_PCM_PATH)) FSCom.remove(VT_PCM_PATH);
+    rec_pcm_file = FSCom.open(VT_PCM_PATH, FILE_WRITE);
+    if (!rec_pcm_file) {
+        LOG_ERROR("Voicetastic: FSCom open(%s) for write failed", VT_PCM_PATH);
         VtAudio::deinitMic();
         return false;
     }
 
-    rec_duration_ms   = duration_ms;
-    rec_started_ms    = millis();
-    rec_audio_in_progress.clear();
-    rec_audio_in_progress.reserve((size_t)(duration_ms / 1000 + 1) * 150 + 32);
-    recording         = true;
-    LOG_INFO("Voicetastic: recording started (%u ms)", (unsigned)duration_ms);
+    rec_duration_ms = duration_ms;
+    rec_started_ms  = millis();
+    rec_state       = eRecRecording;
+    LOG_INFO("Voicetastic: recording started (%u ms) to %s", (unsigned)duration_ms, VT_PCM_PATH);
     return true;
 }
 
 uint32_t VoicetasticModule::recordElapsedMs() const
 {
-    if (!recording) return 0;
+    if (rec_state != eRecRecording) return 0;
     return millis() - rec_started_ms;
 }
 
@@ -143,7 +170,7 @@ bool VoicetasticModule::sendPending(NodeNum to, uint8_t /*channel*/)
     pending_audio.shrink_to_fit();
     if (audio.empty()) return false;
     return enqueueOutbound(audio.data(), audio.size(),
-                           CodecId::CODEC2, (uint8_t)Codec2Mode::M_1200, to);
+                           CodecId::CODEC2, (uint8_t)Codec2Mode::M_3200, to);
 }
 
 void VoicetasticModule::discardPending()
@@ -154,32 +181,116 @@ void VoicetasticModule::discardPending()
 
 void VoicetasticModule::stopRecording()
 {
-    if (!recording) return;
-    recording = false;
-    pending_audio = std::move(rec_audio_in_progress);
-    rec_audio_in_progress.clear();
-    rec_audio_in_progress.shrink_to_fit();
-    LOG_INFO("Voicetastic: recording stopped, %u bytes captured; awaiting send",
-             (unsigned)pending_audio.size());
+    using namespace voicetastic;
+    if (rec_state != eRecRecording) return;
+
+    // Close the write handle and transition into the encoding phase.
+    if (rec_pcm_file) {
+        rec_pcm_file.flush();
+        rec_pcm_file.close();
+    }
+    const size_t pcm_bytes = FSCom.exists(VT_PCM_PATH) ? (size_t)FSCom.open(VT_PCM_PATH, FILE_READ).size() : 0;
+    enc_frames_total = (uint32_t)(pcm_bytes / VT_PCM_BYTES_PER_FRAME);
+    enc_frames_done  = 0;
+    LOG_INFO("Voicetastic: captured %u PCM bytes (%u frames); encoding to Codec2 mode 3200",
+             (unsigned)pcm_bytes, (unsigned)enc_frames_total);
+
+    // NB: do NOT call VtAudio::deinitMic() here. Tearing the ES7210 down via
+    // I2C while the LVGL keyboard task is polling the TCA8418 on the same
+    // bus reliably faults the device on hardware. The mic stays resident for
+    // the lifetime of the firmware; cost is ~22 KB of RAM, which we have.
+
+    if (enc_frames_total == 0) {
+        // Nothing captured (e.g. user stopped immediately). Bail back to idle.
+        if (FSCom.exists(VT_PCM_PATH)) FSCom.remove(VT_PCM_PATH);
+        rec_state = eRecIdle;
+        return;
+    }
+    if (!VtAudio::initEncoder(Codec2Mode::M_3200)) {
+        LOG_ERROR("Voicetastic: codec2 init failed at encoding phase");
+        if (FSCom.exists(VT_PCM_PATH)) FSCom.remove(VT_PCM_PATH);
+        rec_state = eRecIdle;
+        return;
+    }
+    rec_pcm_file = FSCom.open(VT_PCM_PATH, FILE_READ);
+    if (!rec_pcm_file) {
+        LOG_ERROR("Voicetastic: FSCom reopen(%s) for read failed", VT_PCM_PATH);
+        VtAudio::deinitEncoder();
+        rec_state = eRecIdle;
+        return;
+    }
+    pending_audio.clear();
+
+    // Spawn the dedicated encoder worker task. 32 KB stack is generous — gives
+    // codec2_encode's FFT and LSP scratch all the headroom it needs without
+    // competing with the loop task's stack. Priority 1 = same as the TFT task
+    // so we don't preempt LVGL. The task self-deletes when it finishes the
+    // file and signals back via encoder_done.
+    encoder_done = false;
+    encoder_result_audio.clear();
+    encoder_result_audio.reserve((size_t)enc_frames_total * 8);
+    const BaseType_t rc = xTaskCreate(&VoicetasticModule::encoderTaskTrampoline,
+                                      "vtEncode", 32768, this, 1, &encoder_task);
+    if (rc != pdPASS) {
+        LOG_ERROR("Voicetastic: failed to create encoder task (rc=%d)", (int)rc);
+        encoder_task = nullptr;
+        rec_pcm_file.close();
+        FSCom.remove(VT_PCM_PATH);
+        VtAudio::deinitEncoder();
+        rec_state = eRecIdle;
+        return;
+    }
+    LOG_INFO("Voicetastic: encoder worker task started");
+    rec_state = eRecEncoding;
+}
+
+void VoicetasticModule::encoderTaskTrampoline(void *self)
+{
+    static_cast<VoicetasticModule *>(self)->encoderTaskBody();
+}
+
+void VoicetasticModule::encoderTaskBody()
+{
+    using namespace voicetastic;
+    // We're on the dedicated encoder task with 32 KB stack.
+    int16_t pcm[VT_PCM_SAMPLES_PER_FRAME];
+    uint8_t bits[16];
+    const int wanted = VtAudio::bytesPerCodec2Frame();
+    uint32_t frame_count = 0;
+
+    while (rec_pcm_file && rec_pcm_file.available() >= (int)VT_PCM_BYTES_PER_FRAME) {
+        const size_t got = rec_pcm_file.read((uint8_t *)pcm, VT_PCM_BYTES_PER_FRAME);
+        if (got < VT_PCM_BYTES_PER_FRAME) break;
+
+        VtAudio::encodeFrame(pcm, bits);
+        encoder_result_audio.insert(encoder_result_audio.end(), bits, bits + wanted);
+        frame_count++;
+        if ((frame_count % 25) == 0) {
+            LOG_DEBUG("vtEncode: %u/%u frames (%u bytes)",
+                      (unsigned)frame_count, (unsigned)enc_frames_total,
+                      (unsigned)encoder_result_audio.size());
+        }
+        // Polite yield so LVGL + other tasks get slots even though we're at
+        // priority 1 on what should be a co-scheduled core.
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    if (rec_pcm_file) rec_pcm_file.close();
+    if (FSCom.exists(VT_PCM_PATH)) FSCom.remove(VT_PCM_PATH);
+    VtAudio::deinitEncoder();
+    LOG_INFO("vtEncode: complete, %u bytes produced", (unsigned)encoder_result_audio.size());
+    encoder_done = true;       // signal loop task
+    encoder_task = nullptr;
+    vTaskDelete(NULL);          // never returns
 }
 
 void VoicetasticModule::recordFrame()
 {
     using namespace voicetastic;
-    // Static buffers keep the 1.3 KB PCM scratch + Codec2 bit output out of
-    // the loop task's stack. Codec2_encode's own internal locals are small
-    // enough to fit comfortably in what's left of the cooperative task stack.
-    static int16_t pcm[640];
-    static uint8_t bits[16];
-
-    const int samples_per_frame = VtAudio::samplesPerCodec2Frame();
-    const int bytes_per_frame   = VtAudio::bytesPerCodec2Frame();
-    if (samples_per_frame <= 0 || bytes_per_frame <= 0) return;
-
-    const size_t got = VtAudio::readPcm(pcm, samples_per_frame, 30);
-    if ((int)got >= samples_per_frame) {
-        VtAudio::encodeFrame(pcm, bits);
-        rec_audio_in_progress.insert(rec_audio_in_progress.end(), bits, bits + bytes_per_frame);
+    static int16_t pcm[VT_PCM_SAMPLES_PER_FRAME];
+    const size_t got = VtAudio::readPcm(pcm, VT_PCM_SAMPLES_PER_FRAME, 30);
+    if ((int)got >= VT_PCM_SAMPLES_PER_FRAME && rec_pcm_file) {
+        rec_pcm_file.write((const uint8_t *)pcm, VT_PCM_BYTES_PER_FRAME);
     }
     if ((millis() - rec_started_ms) >= rec_duration_ms) {
         stopRecording();
@@ -290,10 +401,29 @@ int32_t VoicetasticModule::runOnce()
     (void)boot_test_sent; (void)boot_ms;
 #endif
 
-    // If a recording is active, pull one Codec2 frame and come back fast.
-    if (recording) {
+    // SD-buffered recording state machine.
+    //   eRecRecording: read PCM from mic, write to SD. Cheap per-tick work,
+    //                  schedule back fast (5 ms).
+    //   eRecEncoding:  read one PCM frame from SD, run codec2_encode, append
+    //                  to pending_audio. codec2_encode is heavy on the loop
+    //                  task stack, so we pace at 50 ms between calls so LVGL
+    //                  + the rest of the firmware get plenty of slots.
+    if (rec_state == eRecRecording) {
         recordFrame();
         return 5;
+    }
+    if (rec_state == eRecEncoding) {
+        // Encoder worker is running on its own task; just poll its done flag.
+        if (encoder_done) {
+            pending_audio = std::move(encoder_result_audio);
+            encoder_result_audio.clear();
+            encoder_result_audio.shrink_to_fit();
+            encoder_done = false;
+            rec_state = eRecIdle;
+            LOG_INFO("Voicetastic: encoding done, %u bytes ready; ENTER to send",
+                     (unsigned)pending_audio.size());
+        }
+        return 100;
     }
 
     if (!tx_active) return 500;

@@ -4,11 +4,14 @@
 
 #if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
 
+#include "FSCommon.h" // FSCom (LittleFS) for buffering raw PCM during capture
 #include "SinglePortModule.h"
 #include "VtChunker.h"
 #include "concurrency/OSThread.h"
 #include "mesh/MeshTypes.h"
 #include "mesh/generated/meshtastic/portnums.pb.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <vector>
 
 /*
@@ -64,7 +67,9 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     // Stop the current recording early. Audio is held; not auto-sent.
     void stopRecording();
 
-    bool isRecording() const { return recording; }
+    // True while we're actively capturing PCM OR encoding the captured PCM
+    // to Codec2 frames. The chat screen treats both as "REC..." for the user.
+    bool isRecording() const { return rec_state != eRecIdle; }
 
     // True when there's a captured-but-unsent audio buffer waiting to be sent.
     bool hasPending() const { return !pending_audio.empty(); }
@@ -99,18 +104,38 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
 
     uint8_t  stream_seq_counter = 0;
 
-    // Recording state. All on the loop task; no atomics or locks needed.
-    bool                  recording = false;
+    // SD-buffered recording state.
+    //
+    //   eRecIdle      — nothing in flight.
+    //   eRecRecording — writing raw PCM to /voice.pcm on SD, one frame per tick.
+    //   eRecEncoding  — reading PCM back from SD and encoding to Codec2 in
+    //                   pending_audio, one frame per tick (spaced so the loop
+    //                   task has breathing room between codec2_encode calls).
+    enum RecState : uint8_t { eRecIdle = 0, eRecRecording, eRecEncoding };
+    RecState              rec_state = eRecIdle;
     uint32_t              rec_started_ms = 0;
     uint32_t              rec_duration_ms = 0;
-    std::vector<uint8_t>  rec_audio_in_progress; // grown frame by frame while recording
+    File                  rec_pcm_file;        // open during eRecRecording (write) and eRecEncoding (read)
+    uint32_t              enc_frames_total = 0; // populated when entering eRecEncoding
+    uint32_t              enc_frames_done = 0;
 
-    // "Armed" audio: captured but not yet sent. The chat screen sends it
-    // explicitly via sendPending() once the user presses ENTER.
+    // "Armed" audio: Codec2 bytes captured but not yet sent. The chat screen
+    // sends it explicitly via sendPending() once the user presses ENTER.
     std::vector<uint8_t>  pending_audio;
 
+    // One-shot encoder worker task. Spawned by stopRecording with a 32 KB
+    // stack; reads PCM from FSCom, runs codec2_encode frame by frame on its
+    // own stack, drops the result into encoder_result_audio, and self-deletes.
+    // The loop task polls encoder_done in eRecEncoding state.
+    std::vector<uint8_t>  encoder_result_audio;
+    volatile bool         encoder_done = false;
+    TaskHandle_t          encoder_task = nullptr;
+
+    static void encoderTaskTrampoline(void *self);
+    void encoderTaskBody();
+
     void sendOneChunk();
-    void recordFrame(); // pull one Codec2 frame from the mic; called from runOnce
+    void recordFrame();   // PCM read -> FSCom write; called from runOnce in eRecRecording
 };
 
 extern VoicetasticModule *voicetasticModule;
