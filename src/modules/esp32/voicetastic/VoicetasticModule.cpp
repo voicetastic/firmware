@@ -127,10 +127,14 @@ void VoicetasticModule::recordingTick(uint32_t now)
     // Pull one Codec2 frame's worth of PCM (40 ms at mode 1200). i2s_read
     // blocks up to 50 ms; that yields between frames so other modules' OSThreads
     // still run.
-    int16_t pcm[640]; // generous: max samples per Codec2 frame across modes
+    //
+    // The pcm/bits buffers are static so they don't sit on the cooperative
+    // main-loop task's stack; with LVGL+LovyanGFX active on the same task,
+    // 1.3 KB of locals per tick is enough to overflow it.
+    static int16_t pcm[640]; // generous: max samples per Codec2 frame across modes
+    static uint8_t bits[16];
     const size_t got = VtAudio::readPcm(pcm, samples_needed, 50);
     if ((int)got >= samples_needed) {
-        uint8_t bits[16] = {0}; // codec2 frames are <= 8 bytes; oversize for safety
         VtAudio::encodeFrame(pcm, bits);
         rec_audio.insert(rec_audio.end(), bits, bits + bytes_per_frame);
     }
