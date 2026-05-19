@@ -67,18 +67,6 @@ VoicetasticModule::VoicetasticModule()
     runProtocolSelfTest();
     voicetastic::rs::runSelfTest();
     boot_ms = millis();
-
-    // Spin up the dedicated codec2 / capture task with an 8 KB stack.
-    // Priority 3 matches AudioModule's codec2HandlerTask convention.
-    // Priority 2 (below LVGL/main but above idle) so the codec2 task can't
-    // starve the UI thread. 8 KB stack covers codec2_encode's frame-internal
-    // arrays + i2s_read scratch comfortably.
-    const BaseType_t rc = xTaskCreate(&VoicetasticModule::codec2TaskTrampoline,
-                                      "vtCodec2", 8192, this, 2, &codec2_task);
-    if (rc != pdPASS) {
-        codec2_task = nullptr;
-        LOG_ERROR("Voicetastic: failed to create codec2 task (rc=%d)", (int)rc);
-    }
 }
 
 bool VoicetasticModule::enqueueOutbound(const uint8_t *audio, size_t audio_len,
@@ -113,57 +101,46 @@ bool VoicetasticModule::enqueueOutbound(const uint8_t *audio, size_t audio_len,
 
 bool VoicetasticModule::startRecording(uint32_t duration_ms, NodeNum to)
 {
-    if (recording.load(std::memory_order_acquire)) {
-        LOG_WARN("Voicetastic: already recording");
-        return false;
-    }
+    using namespace voicetastic;
+    (void)to; // Destination is decided at sendPending() time.
+    if (recording) { LOG_WARN("Voicetastic: already recording"); return false; }
     if (tx_active) { LOG_WARN("Voicetastic: TX in progress; cannot record yet"); return false; }
-    if (rec_audio_ready.load(std::memory_order_acquire)) {
-        LOG_WARN("Voicetastic: previous capture waiting for hand-off");
+    if (!pending_audio.empty()) discardPending();
+
+    if (!VtAudio::initMic()) {
+        LOG_ERROR("Voicetastic: mic init failed");
         return false;
     }
-    if (codec2_task == nullptr) {
-        LOG_ERROR("Voicetastic: codec2 task not running");
+    if (!VtAudio::initEncoder(Codec2Mode::M_1200)) {
+        LOG_ERROR("Voicetastic: codec2 init failed");
+        VtAudio::deinitMic();
         return false;
     }
 
-    (void)to; // Destination is decided at sendPending() time, not at start time.
-    // Discard any previously held audio: starting a new recording supersedes it.
-    if (pending_audio_size.load(std::memory_order_acquire) > 0) {
-        discardPending();
-    }
-
-    rec_duration_ms = duration_ms;
-    rec_stop_requested.store(false, std::memory_order_release);
-    // Notify the task; it picks up duration and goes to work.
-    xTaskNotifyGive(codec2_task);
-    LOG_INFO("Voicetastic: recording requested (%u ms)", (unsigned)duration_ms);
+    rec_duration_ms   = duration_ms;
+    rec_started_ms    = millis();
+    rec_audio_in_progress.clear();
+    rec_audio_in_progress.reserve((size_t)(duration_ms / 1000 + 1) * 150 + 32);
+    recording         = true;
+    LOG_INFO("Voicetastic: recording started (%u ms)", (unsigned)duration_ms);
     return true;
 }
 
 uint32_t VoicetasticModule::recordElapsedMs() const
 {
-    if (!recording.load(std::memory_order_acquire)) return 0;
-    const uint32_t started = rec_started_ms;
-    if (started == 0) return 0;
-    return millis() - started;
+    if (!recording) return 0;
+    return millis() - rec_started_ms;
 }
 
 bool VoicetasticModule::sendPending(NodeNum to, uint8_t /*channel*/)
 {
     using namespace voicetastic;
-    const size_t sz = pending_audio_size.load(std::memory_order_acquire);
-    if (sz == 0) return false;
+    if (pending_audio.empty()) return false;
     if (tx_active) { LOG_WARN("Voicetastic: TX busy; cannot send pending audio yet"); return false; }
 
-    std::vector<uint8_t> audio;
-    {
-        concurrency::LockGuard guard(&rec_audio_lock);
-        audio = std::move(pending_audio);
-        pending_audio.clear();
-    }
-    pending_audio_size.store(0, std::memory_order_release);
-
+    std::vector<uint8_t> audio = std::move(pending_audio);
+    pending_audio.clear();
+    pending_audio.shrink_to_fit();
     if (audio.empty()) return false;
     return enqueueOutbound(audio.data(), audio.size(),
                            CodecId::CODEC2, (uint8_t)Codec2Mode::M_1200, to);
@@ -171,152 +148,42 @@ bool VoicetasticModule::sendPending(NodeNum to, uint8_t /*channel*/)
 
 void VoicetasticModule::discardPending()
 {
-    {
-        concurrency::LockGuard guard(&rec_audio_lock);
-        pending_audio.clear();
-        pending_audio.shrink_to_fit();
-    }
-    pending_audio_size.store(0, std::memory_order_release);
+    pending_audio.clear();
+    pending_audio.shrink_to_fit();
 }
 
 void VoicetasticModule::stopRecording()
 {
-    rec_stop_requested.store(true, std::memory_order_release);
+    if (!recording) return;
+    recording = false;
+    pending_audio = std::move(rec_audio_in_progress);
+    rec_audio_in_progress.clear();
+    rec_audio_in_progress.shrink_to_fit();
+    LOG_INFO("Voicetastic: recording stopped, %u bytes captured; awaiting send",
+             (unsigned)pending_audio.size());
 }
 
-void VoicetasticModule::codec2TaskTrampoline(void *self)
-{
-    static_cast<VoicetasticModule *>(self)->codec2TaskBody();
-}
-
-void VoicetasticModule::codec2TaskBody()
+void VoicetasticModule::recordFrame()
 {
     using namespace voicetastic;
-    // The task lives forever. It blocks on ulTaskNotifyTake until the loop
-    // task signals a new recording is wanted, then runs one full capture cycle
-    // (mic init, encode, mic deinit), publishes the result via rec_audio_done,
-    // and goes back to sleep.
-    //
-    // Heavy locals — int16_t pcm[640] + codec2's internal frame state —
-    // live on THIS task's 8 KB stack, not on the cooperative loopTask's,
-    // which is what we needed to fix.
+    // Static buffers keep the 1.3 KB PCM scratch + Codec2 bit output out of
+    // the loop task's stack. Codec2_encode's own internal locals are small
+    // enough to fit comfortably in what's left of the cooperative task stack.
     static int16_t pcm[640];
     static uint8_t bits[16];
 
-    for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    const int samples_per_frame = VtAudio::samplesPerCodec2Frame();
+    const int bytes_per_frame   = VtAudio::bytesPerCodec2Frame();
+    if (samples_per_frame <= 0 || bytes_per_frame <= 0) return;
 
-#ifdef VOICETASTIC_DRY_RUN
-        // Dry-run mode: pretend to record for the requested duration without
-        // touching the ES7210, I2C, or codec2_encode. Used to isolate whether
-        // a reboot during recording is from the audio path or from elsewhere
-        // (UI, task lifecycle, hand-off). Sleeps 40 ms per "frame" and logs a
-        // heartbeat every ~1 s, just like the real path.
-        const int samples_per_frame_dry = 320;  // mode 1200 nominal
-        const int bytes_per_frame_dry   = 6;
-        const uint32_t duration_ms  = rec_duration_ms;
-        const uint32_t start_ms     = millis();
-        std::vector<uint8_t> audio;
-        audio.reserve(1024);
-        rec_started_ms = start_ms;
-        recording.store(true, std::memory_order_release);
-        LOG_INFO("Voicetastic: DRY-RUN recording started (%u ms)", (unsigned)duration_ms);
-        uint32_t frame_count = 0;
-        (void)samples_per_frame_dry; (void)pcm; (void)bits;
-        while (!rec_stop_requested.load(std::memory_order_acquire) &&
-               (millis() - start_ms) < duration_ms) {
-            // Append 6 bytes of zeros to simulate a Codec2 1200 frame.
-            for (int b = 0; b < bytes_per_frame_dry; b++) audio.push_back(0);
-            frame_count++;
-            if ((frame_count % 25) == 0) {
-                LOG_DEBUG("Voicetastic: DRY-RUN %u frames (%u bytes)",
-                          (unsigned)frame_count, (unsigned)audio.size());
-            }
-            vTaskDelay(pdMS_TO_TICKS(40)); // mimic real frame cadence
-        }
-#else
-        if (!VtAudio::initMic()) {
-            LOG_ERROR("Voicetastic: mic init failed");
-            continue;
-        }
-        if (!VtAudio::initEncoder(Codec2Mode::M_1200)) {
-            LOG_ERROR("Voicetastic: codec2 init failed");
-            VtAudio::deinitMic();
-            continue;
-        }
-
-        const int samples_per_frame = VtAudio::samplesPerCodec2Frame();
-        const int bytes_per_frame   = VtAudio::bytesPerCodec2Frame();
-        const uint32_t duration_ms  = rec_duration_ms;
-        const uint32_t start_ms     = millis();
-
-        std::vector<uint8_t> audio;
-        audio.reserve((size_t)(duration_ms / 1000 + 1) * 150 + 32);
-
-        rec_started_ms = start_ms;
-        recording.store(true, std::memory_order_release);
-        LOG_INFO("Voicetastic: recording started (%u ms)", (unsigned)duration_ms);
-
-        uint32_t frame_count = 0;
-        while (!rec_stop_requested.load(std::memory_order_acquire) &&
-               (millis() - start_ms) < duration_ms) {
-            const size_t got = VtAudio::readPcm(pcm, samples_per_frame, 50);
-            if ((int)got >= samples_per_frame) {
-                VtAudio::encodeFrame(pcm, bits);
-                audio.insert(audio.end(), bits, bits + bytes_per_frame);
-                frame_count++;
-                if ((frame_count % 25) == 0) {
-                    // ~1 s heartbeat at Codec2 1200 (25 frames * 40 ms).
-                    LOG_DEBUG("Voicetastic: %u frames captured (%u bytes)",
-                              (unsigned)frame_count, (unsigned)audio.size());
-                }
-            }
-            // Guarantee a yield so the FreeRTOS idle task gets to run; without
-            // this, codec2_encode in a tight loop can starve the system watchdog
-            // and trigger a reboot.
-            vTaskDelay(1);
-        }
-#endif
-
-        // NOTE: do NOT call VtAudio::deinitEncoder() / deinitMic() between
-        // recordings. The ES7210 deinit path writes back over I2C while the
-        // LVGL keyboard task is polling the TCA8418 on the same bus, and on
-        // hardware that's been reliably faulting the device. Leaving the mic
-        // and Codec2 encoder resident costs ~22 KB of RAM but lets back-to-
-        // back recordings start instantly and avoids the I2C race. Playback
-        // (Phase 6) will need to release the mic before claiming the DAC; the
-        // tear-down logic will live there, behind its own state guard.
-        recording.store(false, std::memory_order_release);
-        rec_stop_requested.store(false, std::memory_order_release);
-
-        LOG_INFO("Voicetastic: recording done, %u bytes encoded", (unsigned)audio.size());
-
-        // Hand off to the loop task for sendPending/discardPending. Locking
-        // just protects the vector move; the ready flag is the sync point.
-        {
-            concurrency::LockGuard guard(&rec_audio_lock);
-            rec_audio_done = std::move(audio);
-        }
-        LOG_INFO("Voicetastic: handed off %u bytes to loop task",
-                 (unsigned)rec_audio_done.size());
-        rec_audio_ready.store(true, std::memory_order_release);
+    const size_t got = VtAudio::readPcm(pcm, samples_per_frame, 30);
+    if ((int)got >= samples_per_frame) {
+        VtAudio::encodeFrame(pcm, bits);
+        rec_audio_in_progress.insert(rec_audio_in_progress.end(), bits, bits + bytes_per_frame);
     }
-}
-
-void VoicetasticModule::finishRecordingHandoff(uint32_t /*now*/)
-{
-    // Move the captured audio from the codec2 task's hand-off slot into the
-    // "held" buffer. The chat screen now decides if/when to actually send it.
-    std::vector<uint8_t> audio;
-    {
-        concurrency::LockGuard guard(&rec_audio_lock);
-        audio = std::move(rec_audio_done);
-        pending_audio = std::move(audio);
+    if ((millis() - rec_started_ms) >= rec_duration_ms) {
+        stopRecording();
     }
-    pending_audio_size.store(pending_audio.size(), std::memory_order_release);
-    rec_audio_ready.store(false, std::memory_order_release);
-    LOG_INFO("Voicetastic: %u bytes captured; awaiting send",
-             (unsigned)pending_audio_size.load(std::memory_order_acquire));
 }
 
 void VoicetasticModule::sendOneChunk()
@@ -423,9 +290,10 @@ int32_t VoicetasticModule::runOnce()
     (void)boot_test_sent; (void)boot_ms;
 #endif
 
-    // Pick up audio handed back by the codec2 task and enqueue it for TX.
-    if (rec_audio_ready.load(std::memory_order_acquire)) {
-        finishRecordingHandoff(now);
+    // If a recording is active, pull one Codec2 frame and come back fast.
+    if (recording) {
+        recordFrame();
+        return 5;
     }
 
     if (!tx_active) return 500;

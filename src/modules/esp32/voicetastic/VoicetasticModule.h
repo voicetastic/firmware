@@ -6,13 +6,9 @@
 
 #include "SinglePortModule.h"
 #include "VtChunker.h"
-#include "concurrency/Lock.h"
 #include "concurrency/OSThread.h"
 #include "mesh/MeshTypes.h"
 #include "mesh/generated/meshtastic/portnums.pb.h"
-#include <atomic>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
 #include <vector>
 
 /*
@@ -57,22 +53,21 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     bool isTransmitting() const { return tx_active; }
 
     // Start a mic recording of up to `duration_ms` milliseconds at Codec2 mode
-    // 1200 (8 kHz, ~150 B/s). The actual capture + encode runs on a dedicated
-    // FreeRTOS task so the cooperative loopTask (which shares space with
-    // LVGL + LovyanGFX) doesn't overflow its stack. When the duration elapses
-    // (or stopRecording() is called), the encoded audio is handed back to the
-    // loop task which calls enqueueOutbound() on its next tick.
-    // Returns false if a recording or TX is already in progress.
+    // 1200 (8 kHz, ~150 B/s). Capture + encode happen one frame per runOnce()
+    // tick on the loop task (40 ms per frame), using static BSS buffers so the
+    // task stack isn't loaded. When the duration elapses (or stopRecording()
+    // is called), the encoded audio is *held* in pending_audio for an explicit
+    // sendPending() call. Returns false if a recording or TX is already in
+    // progress, or the mic / encoder fail to initialize.
     bool startRecording(uint32_t duration_ms, NodeNum to = NODENUM_BROADCAST);
 
-    // Stop the current recording early. After stop, the captured audio is
-    // *held* (not auto-sent) until sendPending() or discardPending() is called.
+    // Stop the current recording early. Audio is held; not auto-sent.
     void stopRecording();
 
-    bool isRecording() const { return recording.load(std::memory_order_acquire); }
+    bool isRecording() const { return recording; }
 
     // True when there's a captured-but-unsent audio buffer waiting to be sent.
-    bool hasPending() const { return pending_audio_size.load(std::memory_order_acquire) > 0; }
+    bool hasPending() const { return !pending_audio.empty(); }
 
     // Send the held audio to the chosen destination. Returns false if there's
     // no held audio or TX is already in progress.
@@ -104,28 +99,18 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
 
     uint8_t  stream_seq_counter = 0;
 
-    // Recording state. The task body sets `recording` true on entry and false
-    // on exit. Loop task reads only; codec2 task writes only.
-    std::atomic<bool>     recording{false};        // task is actively capturing
-    std::atomic<bool>     rec_stop_requested{false}; // loop task asks task to bail early
-    std::atomic<bool>     rec_audio_ready{false};  // task has placed audio in rec_audio_done
-    uint32_t              rec_duration_ms = 0;     // set by loop task before kicking the task
-    uint32_t              rec_started_ms = 0;      // millis() the task entered RECORDING; for elapsedMs()
-    std::vector<uint8_t>  rec_audio_done;          // filled by codec2 task; consumed by loop task
-    concurrency::Lock     rec_audio_lock;          // protects rec_audio_done and pending_audio
+    // Recording state. All on the loop task; no atomics or locks needed.
+    bool                  recording = false;
+    uint32_t              rec_started_ms = 0;
+    uint32_t              rec_duration_ms = 0;
+    std::vector<uint8_t>  rec_audio_in_progress; // grown frame by frame while recording
 
     // "Armed" audio: captured but not yet sent. The chat screen sends it
     // explicitly via sendPending() once the user presses ENTER.
     std::vector<uint8_t>  pending_audio;
-    std::atomic<size_t>   pending_audio_size{0};   // also used as hasPending() flag
-
-    TaskHandle_t          codec2_task = nullptr;
-
-    static void codec2TaskTrampoline(void *self);
-    void codec2TaskBody();
 
     void sendOneChunk();
-    void finishRecordingHandoff(uint32_t now);
+    void recordFrame(); // pull one Codec2 frame from the mic; called from runOnce
 };
 
 extern VoicetasticModule *voicetasticModule;
