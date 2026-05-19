@@ -249,17 +249,23 @@ int32_t VoicetasticModule::runOnce()
     using namespace voicetastic;
     const uint32_t now = millis();
 
+#ifdef VOICETASTIC_BOOT_MIC_TEST
     // One-shot boot test recording: ten seconds after boot, capture ~3 s from
-    // the mic and broadcast it. Lets the user verify ES7210 + Codec2 + TX path
-    // end-to-end with a voicetastic-desktop listener on a tethered radio,
-    // before there's any UI to trigger recordings manually. Removed once
-    // Phase 7 wires a record key.
+    // the mic and broadcast it. Useful for end-to-end testing the mic + Codec2
+    // + TX path against a voicetastic-desktop listener on a tethered radio,
+    // but DOES crash on the t-deck-tft build because codec2_encode running on
+    // the cooperative loopTask is too stack-heavy alongside LVGL+LovyanGFX.
+    // Disabled by default; opt-in with -DVOICETASTIC_BOOT_MIC_TEST=1 in build
+    // flags once codec2 lives on its own FreeRTOS task with its own stack.
     if (!boot_test_sent && (now - boot_ms) > 10000) {
         boot_test_sent = true;
         if (!startRecording(3000)) {
             LOG_ERROR("Voicetastic: boot record failed; mic path unavailable");
         }
     }
+#else
+    (void)boot_test_sent; (void)boot_ms;
+#endif
 
     if (recording) {
         recordingTick(now);
