@@ -135,6 +135,19 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     static void encoderTaskTrampoline(void *self);
     void encoderTaskBody();
 
+    // Playback (Phase 6). Spawned by runOnce when the assembler has a
+    // complete message and we're otherwise idle. Worker tears down the mic,
+    // brings the DAC up, decodes codec2 frame-by-frame, writes PCM to I2S,
+    // tears the DAC back down and re-inits the mic on exit.
+    bool                  playing = false;
+    volatile bool         playback_done = false;
+    TaskHandle_t          playback_task = nullptr;
+    voicetastic::ReceivedVoiceMessage playback_msg;
+
+    static void playbackTaskTrampoline(void *self);
+    void playbackTaskBody();
+    bool startPlayback(const voicetastic::ReceivedVoiceMessage &msg);
+
     // Inbound assembler: parses v2 frames into reassembled voice messages.
     voicetastic::VtAssembler assembler;
 

@@ -31,6 +31,15 @@ struct CODEC2 *s_codec2 = nullptr;
 int s_codec2_samples = 0;
 int s_codec2_bytes   = 0;
 
+// Codec2 decoder state (independent of encoder). NULL when closed.
+struct CODEC2 *s_codec2_dec = nullptr;
+int s_codec2_dec_samples = 0;
+int s_codec2_dec_bytes   = 0;
+
+// I2S DAC state.
+constexpr i2s_port_t kDacI2sPort = I2S_NUM_0;
+bool s_dac_initialized = false;
+
 } // namespace
 
 bool VtAudio::isMicReady() { return s_initialized; }
@@ -177,6 +186,101 @@ void VtAudio::encodeFrame(const int16_t *pcm, uint8_t *out_bytes)
 {
     if (s_codec2 == nullptr) return;
     codec2_encode(s_codec2, out_bytes, const_cast<int16_t *>(pcm));
+}
+
+// ---------- Codec2 decoder ----------
+
+bool VtAudio::initDecoder(Codec2Mode mode)
+{
+    if (s_codec2_dec != nullptr) return true; // idempotent
+    s_codec2_dec = codec2_create((int)mode);
+    if (s_codec2_dec == nullptr) {
+        LOG_ERROR("VtAudio: codec2_create(decoder, mode=%d) failed", (int)mode);
+        return false;
+    }
+    s_codec2_dec_samples = codec2_samples_per_frame(s_codec2_dec);
+    s_codec2_dec_bytes   = (codec2_bits_per_frame(s_codec2_dec) + 7) / 8;
+    LOG_INFO("VtAudio: codec2 decoder ready mode=%d samples/frame=%d bytes/frame=%d",
+             (int)mode, s_codec2_dec_samples, s_codec2_dec_bytes);
+    return true;
+}
+
+void VtAudio::deinitDecoder()
+{
+    if (s_codec2_dec == nullptr) return;
+    codec2_destroy(s_codec2_dec);
+    s_codec2_dec = nullptr;
+    s_codec2_dec_samples = 0;
+    s_codec2_dec_bytes   = 0;
+}
+
+int VtAudio::samplesPerDecodedFrame() { return s_codec2_dec_samples; }
+int VtAudio::bytesPerDecodedFrame()   { return s_codec2_dec_bytes; }
+
+void VtAudio::decodeFrame(const uint8_t *bits, int16_t *pcm_out)
+{
+    if (s_codec2_dec == nullptr) return;
+    codec2_decode(s_codec2_dec, pcm_out, bits);
+}
+
+// ---------- I2S DAC (MAX98357A) ----------
+
+bool VtAudio::initDac()
+{
+    if (s_dac_initialized) return true;
+
+    i2s_config_t cfg = {};
+    cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+    cfg.sample_rate = OUTPUT_RATE_HZ; // 8 kHz matches Codec2 output
+    cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+    cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+    cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+    cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+    cfg.dma_buf_count = 8;
+    cfg.dma_buf_len = 64;
+    cfg.use_apll = false;
+    cfg.tx_desc_auto_clear = true;
+    cfg.fixed_mclk = 0;
+    cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+    cfg.bits_per_chan = I2S_BITS_PER_CHAN_16BIT;
+
+    if (i2s_driver_install(kDacI2sPort, &cfg, 0, NULL) != ESP_OK) {
+        LOG_ERROR("VtAudio: dac i2s_driver_install failed");
+        return false;
+    }
+
+    i2s_pin_config_t pins = {};
+    pins.bck_io_num   = DAC_I2S_BCK;
+    pins.ws_io_num    = DAC_I2S_WS;
+    pins.data_out_num = DAC_I2S_DOUT;
+    pins.data_in_num  = I2S_PIN_NO_CHANGE;
+    pins.mck_io_num   = DAC_I2S_MCLK; // shared with ES7210_LRCK on GPIO 21
+
+    if (i2s_set_pin(kDacI2sPort, &pins) != ESP_OK) {
+        LOG_ERROR("VtAudio: dac i2s_set_pin failed");
+        i2s_driver_uninstall(kDacI2sPort);
+        return false;
+    }
+    i2s_zero_dma_buffer(kDacI2sPort);
+    s_dac_initialized = true;
+    LOG_INFO("VtAudio: DAC initialized at %d Hz mono", OUTPUT_RATE_HZ);
+    return true;
+}
+
+void VtAudio::deinitDac()
+{
+    if (!s_dac_initialized) return;
+    i2s_driver_uninstall(kDacI2sPort);
+    s_dac_initialized = false;
+}
+
+size_t VtAudio::writePcm(const int16_t *pcm, size_t samples)
+{
+    if (!s_dac_initialized || pcm == nullptr || samples == 0) return 0;
+    size_t bytes_written = 0;
+    i2s_write(kDacI2sPort, pcm, samples * sizeof(int16_t), &bytes_written,
+              pdMS_TO_TICKS(500));
+    return bytes_written / sizeof(int16_t);
 }
 
 } // namespace voicetastic

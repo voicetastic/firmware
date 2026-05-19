@@ -54,6 +54,25 @@ public:
     static int  samplesPerCodec2Frame();   // typically 320 at 8 kHz for mode 1200
     static int  bytesPerCodec2Frame();     // 6 at mode 1200
     static void encodeFrame(const int16_t *pcm, uint8_t *out_bytes); // call samplesPerCodec2Frame() in, bytesPerCodec2Frame() out
+
+    // Codec2 decoder (Phase 6). Independent of the encoder so receive +
+    // playback can be active even if we never recorded on this device.
+    static bool initDecoder(Codec2Mode mode);
+    static void deinitDecoder();
+    static int  samplesPerDecodedFrame();
+    static int  bytesPerDecodedFrame();
+    // bits points to bytesPerDecodedFrame() bytes; pcm_out gets samplesPerDecodedFrame() samples.
+    static void decodeFrame(const uint8_t *bits, int16_t *pcm_out);
+
+    // I2S DAC (MAX98357A on T-Deck) for playback. Installed on I2S_NUM_0 so
+    // it doesn't collide with the mic on I2S_NUM_1 -- but GPIO 21 is shared
+    // between ES7210_LRCK and DAC_I2S_MCLK, so the caller MUST deinitMic()
+    // first. Mono 16-bit @ 8 kHz, matching Codec2's output.
+    static bool initDac();
+    static void deinitDac();
+    // Block until `samples` int16 samples have been pushed to the I2S TX
+    // FIFO. Returns the number of samples actually written.
+    static size_t writePcm(const int16_t *pcm, size_t samples);
 };
 
 } // namespace voicetastic

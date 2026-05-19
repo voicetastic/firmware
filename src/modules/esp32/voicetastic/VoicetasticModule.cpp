@@ -249,6 +249,94 @@ void VoicetasticModule::encoderTaskTrampoline(void *self)
     static_cast<VoicetasticModule *>(self)->encoderTaskBody();
 }
 
+bool VoicetasticModule::startPlayback(const voicetastic::ReceivedVoiceMessage &msg)
+{
+    using namespace voicetastic;
+    if (playing) return false;
+    if (rec_state != eRecIdle) return false;     // can't play while recording/encoding
+    if (msg.audio.empty()) return false;
+
+    playback_msg = msg; // copy in (vector copy)
+    playback_done = false;
+
+    const BaseType_t rc = xTaskCreate(&VoicetasticModule::playbackTaskTrampoline,
+                                      "vtPlay", 32768, this, 1, &playback_task);
+    if (rc != pdPASS) {
+        LOG_ERROR("Voicetastic: failed to create playback task (rc=%d)", (int)rc);
+        playback_task = nullptr;
+        playback_msg.audio.clear();
+        return false;
+    }
+    playing = true;
+    LOG_INFO("Voicetastic: playback started mid=%08x (%u bytes, codec=%u/%u)",
+             (unsigned)msg.message_id, (unsigned)msg.audio.size(),
+             (unsigned)msg.codec, (unsigned)msg.codec_param);
+    return true;
+}
+
+void VoicetasticModule::playbackTaskTrampoline(void *self)
+{
+    static_cast<VoicetasticModule *>(self)->playbackTaskBody();
+}
+
+void VoicetasticModule::playbackTaskBody()
+{
+    using namespace voicetastic;
+
+    // We need the DAC's I2S MCLK on GPIO 21, which is shared with ES7210_LRCK.
+    // Release the mic before bringing the DAC up. If the mic deinit reboots
+    // the device, we'll find out here and need a different strategy.
+    VtAudio::deinitMic();
+
+    if (!VtAudio::initDac()) {
+        LOG_ERROR("vtPlay: DAC init failed");
+        playback_done = true;
+        playback_task = nullptr;
+        vTaskDelete(NULL);
+        return;
+    }
+    if (!VtAudio::initDecoder((Codec2Mode)playback_msg.codec_param)) {
+        LOG_ERROR("vtPlay: codec2 decoder init failed");
+        VtAudio::deinitDac();
+        playback_done = true;
+        playback_task = nullptr;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const int samples_per_frame = VtAudio::samplesPerDecodedFrame();
+    const int bytes_per_frame   = VtAudio::bytesPerDecodedFrame();
+
+    int16_t pcm[640];   // ample for any Codec2 mode (max 320 @ mode 1200)
+    const uint8_t *src = playback_msg.audio.data();
+    const size_t   total = playback_msg.audio.size();
+    size_t         consumed = 0;
+    uint32_t       frame_count = 0;
+
+    while (consumed + bytes_per_frame <= total) {
+        VtAudio::decodeFrame(src + consumed, pcm);
+        VtAudio::writePcm(pcm, samples_per_frame);
+        consumed += bytes_per_frame;
+        frame_count++;
+        if ((frame_count % 25) == 0) {
+            LOG_DEBUG("vtPlay: decoded %u frames (%u/%u bytes)",
+                      (unsigned)frame_count, (unsigned)consumed, (unsigned)total);
+        }
+    }
+
+    // Drain the DMA before tearing the DAC down.
+    vTaskDelay(pdMS_TO_TICKS(100));
+    VtAudio::deinitDecoder();
+    VtAudio::deinitDac();
+    // Bring the mic back up so the next record key works.
+    VtAudio::initMic();
+
+    LOG_INFO("vtPlay: done, %u frames decoded", (unsigned)frame_count);
+    playback_done = true;
+    playback_task = nullptr;
+    vTaskDelete(NULL);
+}
+
 void VoicetasticModule::encoderTaskBody()
 {
     using namespace voicetastic;
@@ -410,6 +498,23 @@ int32_t VoicetasticModule::runOnce()
     // Time out stuck inbound assemblies (no NACK loop in this build, so we
     // can't recover them; drop them so they don't leak.)
     assembler.tick(now);
+
+    // Playback lifecycle. If a worker task is running, just wait for it; on
+    // completion, clear state. If idle (no recording, no playback, no TX),
+    // drain the next complete message from the assembler and auto-play it.
+    if (playing && playback_done) {
+        playing = false;
+        playback_done = false;
+        playback_msg.audio.clear();
+        playback_msg.audio.shrink_to_fit();
+        LOG_INFO("Voicetastic: playback complete");
+    }
+    if (!playing && rec_state == eRecIdle && !tx_active) {
+        ReceivedVoiceMessage rxmsg;
+        if (assembler.popComplete(rxmsg)) {
+            startPlayback(rxmsg);
+        }
+    }
 
 #ifdef VOICETASTIC_BOOT_MIC_TEST
     // One-shot boot test recording: ten seconds after boot, ask the codec2
