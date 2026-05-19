@@ -234,19 +234,27 @@ void VoicetasticModule::codec2TaskBody()
             }
         }
 
-        VtAudio::deinitEncoder();
-        VtAudio::deinitMic();
+        // NOTE: do NOT call VtAudio::deinitEncoder() / deinitMic() between
+        // recordings. The ES7210 deinit path writes back over I2C while the
+        // LVGL keyboard task is polling the TCA8418 on the same bus, and on
+        // hardware that's been reliably faulting the device. Leaving the mic
+        // and Codec2 encoder resident costs ~22 KB of RAM but lets back-to-
+        // back recordings start instantly and avoids the I2C race. Playback
+        // (Phase 6) will need to release the mic before claiming the DAC; the
+        // tear-down logic will live there, behind its own state guard.
         recording.store(false, std::memory_order_release);
         rec_stop_requested.store(false, std::memory_order_release);
 
         LOG_INFO("Voicetastic: recording done, %u bytes encoded", (unsigned)audio.size());
 
-        // Hand off to the loop task for enqueueOutbound. Locking just protects
-        // the vector move; the ready flag is the synchronization point.
+        // Hand off to the loop task for sendPending/discardPending. Locking
+        // just protects the vector move; the ready flag is the sync point.
         {
             concurrency::LockGuard guard(&rec_audio_lock);
             rec_audio_done = std::move(audio);
         }
+        LOG_INFO("Voicetastic: handed off %u bytes to loop task",
+                 (unsigned)rec_audio_done.size());
         rec_audio_ready.store(true, std::memory_order_release);
     }
 }
