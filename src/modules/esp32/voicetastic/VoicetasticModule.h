@@ -6,6 +6,7 @@
 
 #include "FSCommon.h" // FSCom (LittleFS) for buffering raw PCM during capture
 #include "SinglePortModule.h"
+#include "VtAssembler.h"
 #include "VtChunker.h"
 #include "concurrency/OSThread.h"
 #include "mesh/MeshTypes.h"
@@ -133,6 +134,9 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
 
     static void encoderTaskTrampoline(void *self);
     void encoderTaskBody();
+
+    // Inbound assembler: parses v2 frames into reassembled voice messages.
+    voicetastic::VtAssembler assembler;
 
     void sendOneChunk();
     void recordFrame();   // PCM read -> FSCom write; called from runOnce in eRecRecording

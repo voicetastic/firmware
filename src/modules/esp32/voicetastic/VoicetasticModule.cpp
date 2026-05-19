@@ -391,7 +391,14 @@ ProcessMessage VoicetasticModule::handleReceived(const meshtastic_MeshPacket &mp
     snprintf(prefix, sizeof(prefix), "rx from=0x%08x body=%u", (unsigned)mp.from, (unsigned)body_len);
     logHeader(prefix, h);
 
-    // Phase 5 will route DATA/PARITY frames to the assembler. For now: log only.
+    // Hand the frame to the per-(from, message_id) assembler. It deals with
+    // shard storage, chunk_size inference (spec §4), FEC reconstruction, and
+    // queuing complete messages for playback (Phase 6).
+    if (assembler.acceptFrame(mp.from, h, p.payload.bytes + HEADER_SIZE, body_len)) {
+        // A new message was just completed. Phase 6 will drain the assembler's
+        // complete-queue into the playback engine; for now we just leave it
+        // sitting there so anyone polling popComplete() can pick it up.
+    }
     return ProcessMessage::CONTINUE;
 }
 
@@ -399,6 +406,10 @@ int32_t VoicetasticModule::runOnce()
 {
     using namespace voicetastic;
     const uint32_t now = millis();
+
+    // Time out stuck inbound assemblies (no NACK loop in this build, so we
+    // can't recover them; drop them so they don't leak.)
+    assembler.tick(now);
 
 #ifdef VOICETASTIC_BOOT_MIC_TEST
     // One-shot boot test recording: ten seconds after boot, ask the codec2
