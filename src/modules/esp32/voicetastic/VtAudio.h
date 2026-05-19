@@ -4,6 +4,7 @@
 
 #if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
 
+#include "VtChunker.h"   // for Codec2Mode
 #include <stdint.h>
 #include <stddef.h>
 
@@ -46,6 +47,13 @@ public:
 
     // Tear down I2S driver and codec. Call before switching to playback.
     static void deinitMic();
+
+    // Codec2 encoder lifecycle. One encoder instance at a time.
+    static bool initEncoder(Codec2Mode mode);
+    static void deinitEncoder();
+    static int  samplesPerCodec2Frame();   // typically 320 at 8 kHz for mode 1200
+    static int  bytesPerCodec2Frame();     // 6 at mode 1200
+    static void encodeFrame(const int16_t *pcm, uint8_t *out_bytes); // call samplesPerCodec2Frame() in, bytesPerCodec2Frame() out
 };
 
 } // namespace voicetastic

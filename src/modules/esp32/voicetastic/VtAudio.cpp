@@ -5,6 +5,7 @@
 #include "audio_drivers/es7210.h"
 #include "configuration.h"
 #include <Wire.h>
+#include <codec2.h>
 #include <driver/i2s.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,11 @@ bool s_initialized = false;
 // before decimation. Sized for ~40 ms of audio = 640 input samples per call.
 constexpr size_t kScratchMax = 1280;
 int16_t s_scratch[kScratchMax];
+
+// Codec2 encoder state. NULL when closed.
+struct CODEC2 *s_codec2 = nullptr;
+int s_codec2_samples = 0;
+int s_codec2_bytes   = 0;
 
 } // namespace
 
@@ -138,6 +144,39 @@ size_t VtAudio::readPcm(int16_t *out, size_t max_samples, uint32_t timeout_ms)
         out[produced] = (int16_t)((a + b) / 2);
     }
     return produced;
+}
+
+bool VtAudio::initEncoder(Codec2Mode mode)
+{
+    if (s_codec2 != nullptr) return true;  // idempotent
+    s_codec2 = codec2_create((int)mode);
+    if (s_codec2 == nullptr) {
+        LOG_ERROR("VtAudio: codec2_create(mode=%d) failed", (int)mode);
+        return false;
+    }
+    s_codec2_samples = codec2_samples_per_frame(s_codec2);
+    s_codec2_bytes   = (codec2_bits_per_frame(s_codec2) + 7) / 8;
+    LOG_INFO("VtAudio: codec2 ready mode=%d samples/frame=%d bytes/frame=%d",
+             (int)mode, s_codec2_samples, s_codec2_bytes);
+    return true;
+}
+
+void VtAudio::deinitEncoder()
+{
+    if (s_codec2 == nullptr) return;
+    codec2_destroy(s_codec2);
+    s_codec2 = nullptr;
+    s_codec2_samples = 0;
+    s_codec2_bytes   = 0;
+}
+
+int VtAudio::samplesPerCodec2Frame() { return s_codec2_samples; }
+int VtAudio::bytesPerCodec2Frame()   { return s_codec2_bytes; }
+
+void VtAudio::encodeFrame(const int16_t *pcm, uint8_t *out_bytes)
+{
+    if (s_codec2 == nullptr) return;
+    codec2_encode(s_codec2, out_bytes, const_cast<int16_t *>(pcm));
 }
 
 } // namespace voicetastic

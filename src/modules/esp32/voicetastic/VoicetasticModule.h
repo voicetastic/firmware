@@ -9,6 +9,7 @@
 #include "concurrency/OSThread.h"
 #include "mesh/MeshTypes.h"
 #include "mesh/generated/meshtastic/portnums.pb.h"
+#include <vector>
 
 /*
  * VoicetasticModule
@@ -51,6 +52,15 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
 
     bool isTransmitting() const { return tx_active; }
 
+    // Start a mic recording of up to `duration_ms` milliseconds at Codec2 mode
+    // 1200 (8 kHz, ~150 B/s). When the duration elapses (or the buffer fills),
+    // the encoded audio is automatically enqueueOutbound()'d. Returns false if
+    // a recording or transmission is already in progress, or the mic / encoder
+    // fails to initialize.
+    bool startRecording(uint32_t duration_ms, NodeNum to = NODENUM_BROADCAST);
+
+    bool isRecording() const { return recording; }
+
   protected:
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
     virtual int32_t runOnce() override;
@@ -71,7 +81,17 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
 
     uint8_t  stream_seq_counter = 0;
 
+    // Recording state (mutually exclusive with TX in this iteration; we wait
+    // for one to finish before starting the other).
+    bool     recording = false;
+    uint32_t rec_start_ms = 0;
+    uint32_t rec_duration_ms = 0;
+    NodeNum  rec_to = NODENUM_BROADCAST;
+    std::vector<uint8_t> rec_audio;   // accumulating Codec2 bytes
+
     void sendOneChunk();
+    void recordingTick(uint32_t now);
+    void finishRecording();
 };
 
 extern VoicetasticModule *voicetasticModule;

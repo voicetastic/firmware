@@ -6,6 +6,7 @@
 #include "NodeDB.h"
 #include "RadioInterface.h"
 #include "Router.h"
+#include "VtAudio.h"
 #include "VtProtocol.h"
 #include "rs/rs.h"
 #include <Arduino.h>
@@ -97,6 +98,64 @@ bool VoicetasticModule::enqueueOutbound(const uint8_t *audio, size_t audio_len,
     return true;
 }
 
+bool VoicetasticModule::startRecording(uint32_t duration_ms, NodeNum to)
+{
+    using namespace voicetastic;
+    if (recording) { LOG_WARN("Voicetastic: already recording"); return false; }
+    if (tx_active) { LOG_WARN("Voicetastic: TX in progress; cannot record yet"); return false; }
+    if (!VtAudio::initMic()) return false;
+    if (!VtAudio::initEncoder(Codec2Mode::M_1200)) { VtAudio::deinitMic(); return false; }
+
+    // Pre-size buffer for the expected duration (~150 B/s at Codec2 1200).
+    rec_audio.clear();
+    rec_audio.reserve((size_t)(duration_ms / 1000 + 1) * 150 + 32);
+    rec_to = to;
+    rec_duration_ms = duration_ms;
+    rec_start_ms = millis();
+    recording = true;
+    LOG_INFO("Voicetastic: recording started (%u ms)", (unsigned)duration_ms);
+    return true;
+}
+
+void VoicetasticModule::recordingTick(uint32_t now)
+{
+    using namespace voicetastic;
+    const int samples_needed = VtAudio::samplesPerCodec2Frame();
+    const int bytes_per_frame = VtAudio::bytesPerCodec2Frame();
+    if (samples_needed <= 0 || bytes_per_frame <= 0) return;
+
+    // Pull one Codec2 frame's worth of PCM (40 ms at mode 1200). i2s_read
+    // blocks up to 50 ms; that yields between frames so other modules' OSThreads
+    // still run.
+    int16_t pcm[640]; // generous: max samples per Codec2 frame across modes
+    const size_t got = VtAudio::readPcm(pcm, samples_needed, 50);
+    if ((int)got >= samples_needed) {
+        uint8_t bits[16] = {0}; // codec2 frames are <= 8 bytes; oversize for safety
+        VtAudio::encodeFrame(pcm, bits);
+        rec_audio.insert(rec_audio.end(), bits, bits + bytes_per_frame);
+    }
+
+    if ((now - rec_start_ms) >= rec_duration_ms) {
+        finishRecording();
+    }
+}
+
+void VoicetasticModule::finishRecording()
+{
+    using namespace voicetastic;
+    VtAudio::deinitEncoder();
+    VtAudio::deinitMic();
+    recording = false;
+
+    LOG_INFO("Voicetastic: recording done, %u bytes encoded", (unsigned)rec_audio.size());
+    if (rec_audio.empty()) return;
+    enqueueOutbound(rec_audio.data(), rec_audio.size(),
+                    CodecId::CODEC2, (uint8_t)Codec2Mode::M_1200, rec_to);
+    // Free the buffer; enqueueOutbound has copied what it needs into tx_msg.
+    rec_audio.clear();
+    rec_audio.shrink_to_fit();
+}
+
 void VoicetasticModule::sendOneChunk()
 {
     using namespace voicetastic;
@@ -186,14 +245,21 @@ int32_t VoicetasticModule::runOnce()
     using namespace voicetastic;
     const uint32_t now = millis();
 
-    // One-shot boot test broadcast: gives an end-to-end interop check against
-    // voicetastic-desktop receivers without needing a mic. Will be removed in
-    // Phase 4 in favour of a mic-triggered path.
+    // One-shot boot test recording: ten seconds after boot, capture ~3 s from
+    // the mic and broadcast it. Lets the user verify ES7210 + Codec2 + TX path
+    // end-to-end with a voicetastic-desktop listener on a tethered radio,
+    // before there's any UI to trigger recordings manually. Removed once
+    // Phase 7 wires a record key.
     if (!boot_test_sent && (now - boot_ms) > 10000) {
         boot_test_sent = true;
-        static const char kTestPayload[] = "Voicetastic firmware test broadcast - phase 3b";
-        enqueueOutbound((const uint8_t *)kTestPayload, sizeof(kTestPayload) - 1,
-                        CodecId::CODEC2, (uint8_t)Codec2Mode::M_1200, NODENUM_BROADCAST);
+        if (!startRecording(3000)) {
+            LOG_ERROR("Voicetastic: boot record failed; mic path unavailable");
+        }
+    }
+
+    if (recording) {
+        recordingTick(now);
+        return 5; // come back quickly for the next 40 ms frame
     }
 
     if (!tx_active) return 500;
