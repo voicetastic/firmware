@@ -64,6 +64,18 @@ bool VoicetasticPacketClient::voicePlayNext()
     return voicetasticModule->playNextPending();
 }
 
+bool VoicetasticPacketClient::voicePlayByMessageId(uint32_t message_id)
+{
+    if (voicetasticModule == nullptr) return false;
+    return voicetasticModule->playByMessageId(message_id);
+}
+
+uint32_t VoicetasticPacketClient::voicePlayMessageId() const
+{
+    if (voicetasticModule == nullptr) return 0;
+    return voicetasticModule->playbackMessageId();
+}
+
 void VoicetasticPacketClient::voicePlayStop()
 {
     if (voicetasticModule == nullptr) return;

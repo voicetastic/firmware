@@ -90,11 +90,13 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     // playback explicitly via these calls.
     size_t   pendingPlayCount() const { return pending_play_queue.size(); }
     bool     playNextPending();              // start playing the oldest queued message
+    bool     playByMessageId(uint32_t message_id); // play the queued message that matches; false if not found
     void     stopPlayback();                 // interrupt current playback (worker exits early)
     bool     isPlaying() const { return playing; }
     uint32_t playbackElapsedMs() const;      // 0 when not playing
     uint32_t playbackTotalMs() const { return play_total_ms; }
     NodeNum  playbackFromNode() const { return play_from_node; }
+    uint32_t playbackMessageId() const { return play_message_id; }
     // Inspect a queued message without consuming it.
     bool     peekPending(size_t index, NodeNum &from, uint32_t &message_id,
                          uint32_t &approx_duration_ms) const;
@@ -183,6 +185,7 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     uint32_t              play_started_ms = 0;   // millis() when worker started writing PCM
     uint32_t              play_total_ms = 0;     // duration of currently-playing or queued-front message
     NodeNum               play_from_node = 0;
+    uint32_t              play_message_id = 0;   // identifies which queued bubble the UI should mark as playing
 
     // Mini-player queue: received messages we have NOT auto-played, waiting
     // for the chat screen to drive them.

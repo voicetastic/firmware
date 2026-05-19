@@ -288,6 +288,7 @@ bool VoicetasticModule::startPlayback(const voicetastic::ReceivedVoiceMessage &m
     playback_done = false;
     playback_stop_requested = false;
     play_from_node = msg.from;
+    play_message_id = msg.message_id;
     play_total_ms = vtEstimateDurationMs(msg);
     play_started_ms = 0; // worker stamps this when it begins writing PCM
 
@@ -299,6 +300,7 @@ bool VoicetasticModule::startPlayback(const voicetastic::ReceivedVoiceMessage &m
         playback_msg.audio.clear();
         play_total_ms = 0;
         play_from_node = 0;
+        play_message_id = 0;
         return false;
     }
     playing = true;
@@ -320,6 +322,21 @@ bool VoicetasticModule::playNextPending()
     voicetastic::ReceivedVoiceMessage msg = std::move(pending_play_queue.front());
     pending_play_queue.erase(pending_play_queue.begin());
     return startPlayback(msg);
+}
+
+bool VoicetasticModule::playByMessageId(uint32_t message_id)
+{
+    if (playing) return false;
+    if (rec_state != eRecIdle) return false;
+    if (tx_active) return false;
+    for (auto it = pending_play_queue.begin(); it != pending_play_queue.end(); ++it) {
+        if (it->message_id == message_id) {
+            voicetastic::ReceivedVoiceMessage msg = std::move(*it);
+            pending_play_queue.erase(it);
+            return startPlayback(msg);
+        }
+    }
+    return false;
 }
 
 void VoicetasticModule::stopPlayback()
@@ -594,6 +611,7 @@ int32_t VoicetasticModule::runOnce()
         play_total_ms = 0;
         play_started_ms = 0;
         play_from_node = 0;
+        play_message_id = 0;
         LOG_INFO("Voicetastic: playback complete");
     }
     ReceivedVoiceMessage rxmsg;

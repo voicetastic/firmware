@@ -25,11 +25,13 @@ class VoicetasticPacketClient : public PacketClient
     // Mini-player.
     size_t    voicePlayPendingCount() const override;
     bool      voicePlayNext() override;
+    bool      voicePlayByMessageId(uint32_t message_id) override;
     void      voicePlayStop() override;
     bool      voicePlayIsPlaying() const override;
     uint32_t  voicePlayElapsedMs() const override;
     uint32_t  voicePlayTotalMs() const override;
     uint32_t  voicePlayFromNode() const override;
+    uint32_t  voicePlayMessageId() const override;
     bool      voicePlayPeek(size_t index, uint32_t &from, uint32_t &message_id,
                             uint32_t &approx_duration_ms) const override;
 
