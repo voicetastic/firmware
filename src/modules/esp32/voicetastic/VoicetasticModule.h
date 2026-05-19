@@ -5,7 +5,9 @@
 #if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
 
 #include "SinglePortModule.h"
+#include "VtChunker.h"
 #include "concurrency/OSThread.h"
+#include "mesh/MeshTypes.h"
 #include "mesh/generated/meshtastic/portnums.pb.h"
 
 /*
@@ -40,9 +42,36 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
   public:
     VoicetasticModule();
 
+    // Queue an outbound message. Builds + FEC-encodes + chunks, then drives
+    // the runOnce() TX loop. Returns false if another message is already in
+    // flight or the audio is too large for the current modem preset.
+    bool enqueueOutbound(const uint8_t *audio, size_t audio_len,
+                         voicetastic::CodecId codec, uint8_t codec_param,
+                         NodeNum to = NODENUM_BROADCAST);
+
+    bool isTransmitting() const { return tx_active; }
+
   protected:
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
     virtual int32_t runOnce() override;
+
+  private:
+    // TX state. One in-flight message at a time in this iteration.
+    voicetastic::OutboundMessage tx_msg{};
+    bool     tx_active = false;
+    uint16_t tx_next_chunk = 0;       // 0..(total_data + parity_count - 1)
+    uint32_t tx_paced_until_ms = 0;
+    NodeNum  tx_to = NODENUM_BROADCAST;
+
+    // Boot-time test broadcast: sent once a few seconds after boot to verify
+    // the wire pipeline against voicetastic-desktop receivers. Phase 4 will
+    // replace this with a mic-driven path.
+    bool     boot_test_sent = false;
+    uint32_t boot_ms = 0;
+
+    uint8_t  stream_seq_counter = 0;
+
+    void sendOneChunk();
 };
 
 extern VoicetasticModule *voicetasticModule;
