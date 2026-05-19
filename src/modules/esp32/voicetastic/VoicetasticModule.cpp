@@ -328,13 +328,14 @@ void VoicetasticModule::playbackTaskBody()
     vTaskDelay(pdMS_TO_TICKS(100));
     VtAudio::deinitDecoder();
     VtAudio::deinitDac();
-    // KNOWN LIMITATION: we don't re-init the mic here. GPIO 21 is shared
-    // between ES7210_LRCK and DAC_I2S_MCLK; the legacy i2s_legacy driver
-    // doesn't fully reset the pin's drive direction on i2s_driver_uninstall,
-    // so a subsequent i2s_driver_install on the mic's port (I2S_NUM_1) was
-    // failing. Recording is unavailable until the device reboots after a
-    // playback. Proper fix is to either pinMode(GPIO 21, INPUT) here or move
-    // to the new i2s_std driver which has explicit per-channel teardown.
+    // VtAudio::deinitDac() now resets the shared GPIO 21 (and the other DAC
+    // pins) back to INPUT, so the mic's I2S_NUM_1 install can claim LRCK
+    // cleanly. A short settle pause makes the transition reliable on the
+    // legacy i2s_legacy driver.
+    vTaskDelay(pdMS_TO_TICKS(20));
+    if (!VtAudio::initMic()) {
+        LOG_ERROR("vtPlay: mic re-init failed after playback; record disabled until reboot");
+    }
 
     LOG_INFO("vtPlay: done, %u frames decoded", (unsigned)frame_count);
     playback_done = true;

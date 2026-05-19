@@ -125,6 +125,15 @@ void VtAudio::deinitMic()
     if (!s_initialized) return;
     i2s_driver_uninstall(kI2sPort);
     es7210_adc_deinit();
+    // GPIO 21 is shared between ES7210_LRCK and DAC_I2S_MCLK. The legacy I2S
+    // driver leaves pins configured as outputs after uninstall, which causes
+    // the next install on the same pin to fail. Force the shared pins back
+    // to a neutral input state so the DAC (or a future re-init of the mic
+    // itself) can grab them cleanly.
+    pinMode(ES7210_SCK, INPUT);
+    pinMode(ES7210_DIN, INPUT);
+    pinMode(ES7210_LRCK, INPUT);   // == GPIO 21, shared with DAC_I2S_MCLK
+    pinMode(ES7210_MCLK, INPUT);
     s_initialized = false;
 }
 
@@ -271,6 +280,13 @@ void VtAudio::deinitDac()
 {
     if (!s_dac_initialized) return;
     i2s_driver_uninstall(kDacI2sPort);
+    // Symmetric pin reset (see deinitMic). The mic's I2S_NUM_1 install needs
+    // to claim GPIO 21 for LRCK; the legacy I2S driver doesn't put pins back
+    // into a fresh-input state on uninstall, so we do it explicitly.
+    pinMode(DAC_I2S_BCK, INPUT);
+    pinMode(DAC_I2S_WS, INPUT);
+    pinMode(DAC_I2S_DOUT, INPUT);
+    pinMode(DAC_I2S_MCLK, INPUT);  // == GPIO 21, shared with ES7210_LRCK
     s_dac_initialized = false;
 }
 
