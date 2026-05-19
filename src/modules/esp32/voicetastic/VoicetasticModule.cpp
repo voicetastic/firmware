@@ -6,6 +6,7 @@
 #include "NodeDB.h"
 #include "Router.h"
 #include "VtProtocol.h"
+#include "rs/rs.h"
 
 VoicetasticModule *voicetasticModule;
 
@@ -58,6 +59,7 @@ VoicetasticModule::VoicetasticModule()
 {
     LOG_INFO("Voicetastic module init (port=%d, scope=TX+RX Codec2 plaintext+FEC)", (int)meshtastic_PortNum_PRIVATE_APP);
     runProtocolSelfTest();
+    voicetastic::rs::runSelfTest();
 }
 
 ProcessMessage VoicetasticModule::handleReceived(const meshtastic_MeshPacket &mp)
