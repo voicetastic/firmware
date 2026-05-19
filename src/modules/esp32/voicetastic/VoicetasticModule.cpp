@@ -170,7 +170,7 @@ bool VoicetasticModule::sendPending(NodeNum to, uint8_t /*channel*/)
     pending_audio.shrink_to_fit();
     if (audio.empty()) return false;
     return enqueueOutbound(audio.data(), audio.size(),
-                           CodecId::CODEC2, (uint8_t)Codec2Mode::M_3200, to);
+                           CodecId::CODEC2, (uint8_t)Codec2Mode::M_1200, to);
 }
 
 void VoicetasticModule::discardPending()
@@ -206,7 +206,7 @@ void VoicetasticModule::stopRecording()
         rec_state = eRecIdle;
         return;
     }
-    if (!VtAudio::initEncoder(Codec2Mode::M_3200)) {
+    if (!VtAudio::initEncoder(Codec2Mode::M_1200)) {
         LOG_ERROR("Voicetastic: codec2 init failed at encoding phase");
         if (FSCom.exists(VT_PCM_PATH)) FSCom.remove(VT_PCM_PATH);
         rec_state = eRecIdle;
@@ -288,9 +288,23 @@ void VoicetasticModule::recordFrame()
 {
     using namespace voicetastic;
     static int16_t pcm[VT_PCM_SAMPLES_PER_FRAME];
+    static uint32_t rec_frame_count = 0;
     const size_t got = VtAudio::readPcm(pcm, VT_PCM_SAMPLES_PER_FRAME, 30);
     if ((int)got >= VT_PCM_SAMPLES_PER_FRAME && rec_pcm_file) {
         rec_pcm_file.write((const uint8_t *)pcm, VT_PCM_BYTES_PER_FRAME);
+        rec_frame_count++;
+        // Magnitude heartbeat every ~1 s: if pmax stays at 0 or a tiny single-
+        // digit value, the mic is producing silence and the captured audio
+        // will decode to nothing. A live mic should report pmax in the hundreds
+        // for ambient noise, thousands for speech.
+        if ((rec_frame_count % 25) == 0) {
+            int16_t pmax = 0;
+            for (int i = 0; i < VT_PCM_SAMPLES_PER_FRAME; i++) {
+                const int16_t a = pcm[i] < 0 ? (int16_t)-pcm[i] : pcm[i];
+                if (a > pmax) pmax = a;
+            }
+            LOG_DEBUG("vtRec: %u frames, pcm |max|=%d", (unsigned)rec_frame_count, (int)pmax);
+        }
     }
     if ((millis() - rec_started_ms) >= rec_duration_ms) {
         stopRecording();
