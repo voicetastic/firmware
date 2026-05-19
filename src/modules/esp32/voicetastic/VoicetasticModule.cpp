@@ -8,6 +8,7 @@
 #include "Router.h"
 #include "VtAudio.h"
 #include "VtProtocol.h"
+#include "concurrency/LockGuard.h"
 #include "rs/rs.h"
 #include <Arduino.h>
 #include <esp_random.h>
@@ -66,6 +67,15 @@ VoicetasticModule::VoicetasticModule()
     runProtocolSelfTest();
     voicetastic::rs::runSelfTest();
     boot_ms = millis();
+
+    // Spin up the dedicated codec2 / capture task with an 8 KB stack.
+    // Priority 3 matches AudioModule's codec2HandlerTask convention.
+    const BaseType_t rc = xTaskCreate(&VoicetasticModule::codec2TaskTrampoline,
+                                      "vtCodec2", 8192, this, 3, &codec2_task);
+    if (rc != pdPASS) {
+        codec2_task = nullptr;
+        LOG_ERROR("Voicetastic: failed to create codec2 task (rc=%d)", (int)rc);
+    }
 }
 
 bool VoicetasticModule::enqueueOutbound(const uint8_t *audio, size_t audio_len,
@@ -100,64 +110,118 @@ bool VoicetasticModule::enqueueOutbound(const uint8_t *audio, size_t audio_len,
 
 bool VoicetasticModule::startRecording(uint32_t duration_ms, NodeNum to)
 {
-    using namespace voicetastic;
-    if (recording) { LOG_WARN("Voicetastic: already recording"); return false; }
+    if (recording.load(std::memory_order_acquire)) {
+        LOG_WARN("Voicetastic: already recording");
+        return false;
+    }
     if (tx_active) { LOG_WARN("Voicetastic: TX in progress; cannot record yet"); return false; }
-    if (!VtAudio::initMic()) return false;
-    if (!VtAudio::initEncoder(Codec2Mode::M_1200)) { VtAudio::deinitMic(); return false; }
+    if (rec_audio_ready.load(std::memory_order_acquire)) {
+        LOG_WARN("Voicetastic: previous capture waiting for hand-off");
+        return false;
+    }
+    if (codec2_task == nullptr) {
+        LOG_ERROR("Voicetastic: codec2 task not running");
+        return false;
+    }
 
-    // Pre-size buffer for the expected duration (~150 B/s at Codec2 1200).
-    rec_audio.clear();
-    rec_audio.reserve((size_t)(duration_ms / 1000 + 1) * 150 + 32);
-    rec_to = to;
     rec_duration_ms = duration_ms;
-    rec_start_ms = millis();
-    recording = true;
-    LOG_INFO("Voicetastic: recording started (%u ms)", (unsigned)duration_ms);
+    rec_to_pending  = to;
+    rec_stop_requested.store(false, std::memory_order_release);
+    // Notify the task; it picks up duration/to and goes to work.
+    xTaskNotifyGive(codec2_task);
+    LOG_INFO("Voicetastic: recording requested (%u ms)", (unsigned)duration_ms);
     return true;
 }
 
-void VoicetasticModule::recordingTick(uint32_t now)
+void VoicetasticModule::stopRecording()
+{
+    rec_stop_requested.store(true, std::memory_order_release);
+}
+
+void VoicetasticModule::codec2TaskTrampoline(void *self)
+{
+    static_cast<VoicetasticModule *>(self)->codec2TaskBody();
+}
+
+void VoicetasticModule::codec2TaskBody()
 {
     using namespace voicetastic;
-    const int samples_needed = VtAudio::samplesPerCodec2Frame();
-    const int bytes_per_frame = VtAudio::bytesPerCodec2Frame();
-    if (samples_needed <= 0 || bytes_per_frame <= 0) return;
-
-    // Pull one Codec2 frame's worth of PCM (40 ms at mode 1200). i2s_read
-    // blocks up to 50 ms; that yields between frames so other modules' OSThreads
-    // still run.
+    // The task lives forever. It blocks on ulTaskNotifyTake until the loop
+    // task signals a new recording is wanted, then runs one full capture cycle
+    // (mic init, encode, mic deinit), publishes the result via rec_audio_done,
+    // and goes back to sleep.
     //
-    // The pcm/bits buffers are static so they don't sit on the cooperative
-    // main-loop task's stack; with LVGL+LovyanGFX active on the same task,
-    // 1.3 KB of locals per tick is enough to overflow it.
-    static int16_t pcm[640]; // generous: max samples per Codec2 frame across modes
+    // Heavy locals — int16_t pcm[640] + codec2's internal frame state —
+    // live on THIS task's 8 KB stack, not on the cooperative loopTask's,
+    // which is what we needed to fix.
+    static int16_t pcm[640];
     static uint8_t bits[16];
-    const size_t got = VtAudio::readPcm(pcm, samples_needed, 50);
-    if ((int)got >= samples_needed) {
-        VtAudio::encodeFrame(pcm, bits);
-        rec_audio.insert(rec_audio.end(), bits, bits + bytes_per_frame);
-    }
 
-    if ((now - rec_start_ms) >= rec_duration_ms) {
-        finishRecording();
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        if (!VtAudio::initMic()) {
+            LOG_ERROR("Voicetastic: mic init failed");
+            continue;
+        }
+        if (!VtAudio::initEncoder(Codec2Mode::M_1200)) {
+            LOG_ERROR("Voicetastic: codec2 init failed");
+            VtAudio::deinitMic();
+            continue;
+        }
+
+        const int samples_per_frame = VtAudio::samplesPerCodec2Frame();
+        const int bytes_per_frame   = VtAudio::bytesPerCodec2Frame();
+        const uint32_t duration_ms  = rec_duration_ms;
+        const uint32_t start_ms     = millis();
+
+        std::vector<uint8_t> audio;
+        audio.reserve((size_t)(duration_ms / 1000 + 1) * 150 + 32);
+
+        recording.store(true, std::memory_order_release);
+        LOG_INFO("Voicetastic: recording started (%u ms)", (unsigned)duration_ms);
+
+        while (!rec_stop_requested.load(std::memory_order_acquire) &&
+               (millis() - start_ms) < duration_ms) {
+            const size_t got = VtAudio::readPcm(pcm, samples_per_frame, 50);
+            if ((int)got >= samples_per_frame) {
+                VtAudio::encodeFrame(pcm, bits);
+                audio.insert(audio.end(), bits, bits + bytes_per_frame);
+            }
+        }
+
+        VtAudio::deinitEncoder();
+        VtAudio::deinitMic();
+        recording.store(false, std::memory_order_release);
+        rec_stop_requested.store(false, std::memory_order_release);
+
+        LOG_INFO("Voicetastic: recording done, %u bytes encoded", (unsigned)audio.size());
+
+        // Hand off to the loop task for enqueueOutbound. Locking just protects
+        // the vector move; the ready flag is the synchronization point.
+        {
+            concurrency::LockGuard guard(&rec_audio_lock);
+            rec_audio_done = std::move(audio);
+        }
+        rec_audio_ready.store(true, std::memory_order_release);
     }
 }
 
-void VoicetasticModule::finishRecording()
+void VoicetasticModule::finishRecordingHandoff(uint32_t /*now*/)
 {
     using namespace voicetastic;
-    VtAudio::deinitEncoder();
-    VtAudio::deinitMic();
-    recording = false;
+    std::vector<uint8_t> audio;
+    NodeNum to;
+    {
+        concurrency::LockGuard guard(&rec_audio_lock);
+        audio = std::move(rec_audio_done);
+    }
+    to = rec_to_pending;
+    rec_audio_ready.store(false, std::memory_order_release);
 
-    LOG_INFO("Voicetastic: recording done, %u bytes encoded", (unsigned)rec_audio.size());
-    if (rec_audio.empty()) return;
-    enqueueOutbound(rec_audio.data(), rec_audio.size(),
-                    CodecId::CODEC2, (uint8_t)Codec2Mode::M_1200, rec_to);
-    // Free the buffer; enqueueOutbound has copied what it needs into tx_msg.
-    rec_audio.clear();
-    rec_audio.shrink_to_fit();
+    if (audio.empty()) return;
+    enqueueOutbound(audio.data(), audio.size(),
+                    CodecId::CODEC2, (uint8_t)Codec2Mode::M_1200, to);
 }
 
 void VoicetasticModule::sendOneChunk()
@@ -250,26 +314,23 @@ int32_t VoicetasticModule::runOnce()
     const uint32_t now = millis();
 
 #ifdef VOICETASTIC_BOOT_MIC_TEST
-    // One-shot boot test recording: ten seconds after boot, capture ~3 s from
-    // the mic and broadcast it. Useful for end-to-end testing the mic + Codec2
-    // + TX path against a voicetastic-desktop listener on a tethered radio,
-    // but DOES crash on the t-deck-tft build because codec2_encode running on
-    // the cooperative loopTask is too stack-heavy alongside LVGL+LovyanGFX.
-    // Disabled by default; opt-in with -DVOICETASTIC_BOOT_MIC_TEST=1 in build
-    // flags once codec2 lives on its own FreeRTOS task with its own stack.
+    // One-shot boot test recording: ten seconds after boot, ask the codec2
+    // task to capture ~3 s and broadcast it. Opt-in via build flag; useful
+    // for verifying the mic + codec2 + TX path against voicetastic-desktop on
+    // a tethered radio when no manual trigger is wired yet.
     if (!boot_test_sent && (now - boot_ms) > 10000) {
         boot_test_sent = true;
         if (!startRecording(3000)) {
-            LOG_ERROR("Voicetastic: boot record failed; mic path unavailable");
+            LOG_ERROR("Voicetastic: boot record request rejected");
         }
     }
 #else
     (void)boot_test_sent; (void)boot_ms;
 #endif
 
-    if (recording) {
-        recordingTick(now);
-        return 5; // come back quickly for the next 40 ms frame
+    // Pick up audio handed back by the codec2 task and enqueue it for TX.
+    if (rec_audio_ready.load(std::memory_order_acquire)) {
+        finishRecordingHandoff(now);
     }
 
     if (!tx_active) return 500;

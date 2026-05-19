@@ -6,9 +6,13 @@
 
 #include "SinglePortModule.h"
 #include "VtChunker.h"
+#include "concurrency/Lock.h"
 #include "concurrency/OSThread.h"
 #include "mesh/MeshTypes.h"
 #include "mesh/generated/meshtastic/portnums.pb.h"
+#include <atomic>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <vector>
 
 /*
@@ -53,13 +57,18 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     bool isTransmitting() const { return tx_active; }
 
     // Start a mic recording of up to `duration_ms` milliseconds at Codec2 mode
-    // 1200 (8 kHz, ~150 B/s). When the duration elapses (or the buffer fills),
-    // the encoded audio is automatically enqueueOutbound()'d. Returns false if
-    // a recording or transmission is already in progress, or the mic / encoder
-    // fails to initialize.
+    // 1200 (8 kHz, ~150 B/s). The actual capture + encode runs on a dedicated
+    // FreeRTOS task so the cooperative loopTask (which shares space with
+    // LVGL + LovyanGFX) doesn't overflow its stack. When the duration elapses
+    // (or stopRecording() is called), the encoded audio is handed back to the
+    // loop task which calls enqueueOutbound() on its next tick.
+    // Returns false if a recording or TX is already in progress.
     bool startRecording(uint32_t duration_ms, NodeNum to = NODENUM_BROADCAST);
 
-    bool isRecording() const { return recording; }
+    // Stop the current recording early; the captured-so-far audio is still sent.
+    void stopRecording();
+
+    bool isRecording() const { return recording.load(std::memory_order_acquire); }
 
   protected:
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
@@ -81,17 +90,23 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
 
     uint8_t  stream_seq_counter = 0;
 
-    // Recording state (mutually exclusive with TX in this iteration; we wait
-    // for one to finish before starting the other).
-    bool     recording = false;
-    uint32_t rec_start_ms = 0;
-    uint32_t rec_duration_ms = 0;
-    NodeNum  rec_to = NODENUM_BROADCAST;
-    std::vector<uint8_t> rec_audio;   // accumulating Codec2 bytes
+    // Recording state. The task body sets `recording` true on entry and false
+    // on exit. Loop task reads only; codec2 task writes only.
+    std::atomic<bool>     recording{false};        // task is actively capturing
+    std::atomic<bool>     rec_stop_requested{false}; // loop task asks task to bail early
+    std::atomic<bool>     rec_audio_ready{false};  // task has placed audio in rec_audio_done
+    uint32_t              rec_duration_ms = 0;     // set by loop task before kicking the task
+    NodeNum               rec_to_pending = NODENUM_BROADCAST;
+    std::vector<uint8_t>  rec_audio_done;          // filled by codec2 task; consumed by loop task
+    concurrency::Lock     rec_audio_lock;          // protects rec_audio_done across the hand-off
+
+    TaskHandle_t          codec2_task = nullptr;
+
+    static void codec2TaskTrampoline(void *self);
+    void codec2TaskBody();
 
     void sendOneChunk();
-    void recordingTick(uint32_t now);
-    void finishRecording();
+    void finishRecordingHandoff(uint32_t now);
 };
 
 extern VoicetasticModule *voicetasticModule;
