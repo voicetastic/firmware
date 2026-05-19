@@ -14,6 +14,8 @@ namespace voicetastic {
 // One reassembled voice message, ready for playback or hand-off.
 struct ReceivedVoiceMessage {
     NodeNum   from;
+    NodeNum   to;                  // MeshPacket destination (broadcast or this node)
+    uint8_t   channel;             // MeshPacket channel index
     uint32_t  message_id;
     CodecId   codec;
     uint8_t   codec_param;
@@ -21,6 +23,7 @@ struct ReceivedVoiceMessage {
     uint8_t   received_data;       // data shards that arrived directly
     uint8_t   recovered_via_fec;   // data shards reconstructed by RS
     uint32_t  completed_ms;
+    bool      played = false;      // set by the module after at least one playback
     std::vector<uint8_t> audio;    // reassembled codec frame bytes (no container)
 };
 
@@ -33,8 +36,11 @@ class VtAssembler {
     VtAssembler() = default;
 
     // Accept a parsed v2 frame. Returns true iff the call finalized a new
-    // message (popComplete() is now non-empty).
-    bool acceptFrame(NodeNum from, const VtHeader &h, const uint8_t *body, size_t body_len);
+    // message (popComplete() is now non-empty). `to` / `channel` come from
+    // the MeshPacket envelope and ride along on the eventual
+    // ReceivedVoiceMessage so the UI can route the chat bubble correctly.
+    bool acceptFrame(NodeNum from, NodeNum to, uint8_t channel,
+                     const VtHeader &h, const uint8_t *body, size_t body_len);
 
     // Drop stuck assemblies older than the timeout (called from runOnce).
     void tick(uint32_t now_ms);
@@ -54,6 +60,8 @@ class VtAssembler {
     struct AssemblyState {
         bool       in_use = false;
         NodeNum    from;
+        NodeNum    to;
+        uint8_t    channel;
         uint32_t   message_id;
         CodecId    codec;
         uint8_t    codec_param;

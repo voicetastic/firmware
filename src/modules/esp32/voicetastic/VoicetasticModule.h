@@ -100,6 +100,13 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     // Inspect a queued message without consuming it.
     bool     peekPending(size_t index, NodeNum &from, uint32_t &message_id,
                          uint32_t &approx_duration_ms) const;
+    // Extended peek: also exposes `to` (broadcast or this node), channel
+    // index, and whether the message has been played at least once. Used by
+    // the chat-screen mini-player widget to route bubbles to the right chat
+    // and dim already-played entries.
+    bool     peekPendingFull(size_t index, NodeNum &from, NodeNum &to, uint8_t &channel,
+                             uint32_t &message_id, uint32_t &approx_duration_ms,
+                             bool &played) const;
 
     // True when there's a captured-but-unsent audio buffer waiting to be sent.
     bool hasPending() const { return !pending_audio.empty(); }
@@ -187,8 +194,11 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     NodeNum               play_from_node = 0;
     uint32_t              play_message_id = 0;   // identifies which queued bubble the UI should mark as playing
 
-    // Mini-player queue: received messages we have NOT auto-played, waiting
-    // for the chat screen to drive them.
+    // Mini-player inbox: received voice messages, capped at kMaxInbox. Entries
+    // persist after playback (each carries a `played` flag) so the chat-screen
+    // widget can replay them. When the cap is hit, the oldest entry is dropped
+    // FIFO to bound RAM usage.
+    static constexpr size_t kMaxInbox = 16;
     std::vector<voicetastic::ReceivedVoiceMessage> pending_play_queue;
 
     static void playbackTaskTrampoline(void *self);

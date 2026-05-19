@@ -61,7 +61,8 @@ size_t VtAssembler::inProgressCount() const
     return n;
 }
 
-bool VtAssembler::acceptFrame(NodeNum from, const VtHeader &h, const uint8_t *body, size_t body_len)
+bool VtAssembler::acceptFrame(NodeNum from, NodeNum to, uint8_t channel,
+                              const VtHeader &h, const uint8_t *body, size_t body_len)
 {
     using namespace voicetastic;
     // Per spec §9.2 rejection rules (subset we can check at this layer):
@@ -79,6 +80,8 @@ bool VtAssembler::acceptFrame(NodeNum from, const VtHeader &h, const uint8_t *bo
     if (s == nullptr) {
         s = allocateSlot(from, h.message_id);
         s->started_ms = millis();
+        s->to = to;
+        s->channel = channel;
         s->codec = h.codec;
         s->codec_param = h.codec_param;
         s->stream_seq = h.stream_seq;
@@ -214,6 +217,8 @@ void VtAssembler::publish(AssemblyState &s)
     // is trimmed to last_data_real_size.
     ReceivedVoiceMessage msg{};
     msg.from = s.from;
+    msg.to = s.to;
+    msg.channel = s.channel;
     msg.message_id = s.message_id;
     msg.codec = s.codec;
     msg.codec_param = s.codec_param;

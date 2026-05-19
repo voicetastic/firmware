@@ -119,4 +119,20 @@ bool VoicetasticPacketClient::voicePlayPeek(size_t index, uint32_t &from, uint32
     return ok;
 }
 
+bool VoicetasticPacketClient::voicePlayPeekFull(size_t index, uint32_t &from, uint32_t &to,
+                                                uint8_t &channel, uint32_t &message_id,
+                                                uint32_t &approx_duration_ms, bool &played) const
+{
+    if (voicetasticModule == nullptr) {
+        from = 0; to = 0; channel = 0; message_id = 0; approx_duration_ms = 0; played = false;
+        return false;
+    }
+    NodeNum from_nn = 0, to_nn = 0;
+    const bool ok = voicetasticModule->peekPendingFull(index, from_nn, to_nn, channel,
+                                                       message_id, approx_duration_ms, played);
+    from = (uint32_t)from_nn;
+    to = (uint32_t)to_nn;
+    return ok;
+}
+
 #endif // ARCH_ESP32 && !MESHTASTIC_EXCLUDE_VOICETASTIC && HAS_TFT

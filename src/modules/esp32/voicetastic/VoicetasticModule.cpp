@@ -317,11 +317,18 @@ bool VoicetasticModule::playNextPending()
     if (playing) return false;
     if (rec_state != eRecIdle) return false;
     if (tx_active) return false;
-    // Move-out the oldest queued message and hand it to the existing playback
-    // worker. The worker self-deletes when done; runOnce observes playback_done.
-    voicetastic::ReceivedVoiceMessage msg = std::move(pending_play_queue.front());
-    pending_play_queue.erase(pending_play_queue.begin());
-    return startPlayback(msg);
+    // Play the first unplayed entry. Copy (don't move) so the audio stays in
+    // the inbox for re-play by the chat-screen mini-player; mark as played.
+    for (auto &m : pending_play_queue) {
+        if (m.played) continue;
+        voicetastic::ReceivedVoiceMessage copy = m;
+        m.played = true;
+        return startPlayback(copy);
+    }
+    // All already played: fall back to playing the oldest.
+    voicetastic::ReceivedVoiceMessage copy = pending_play_queue.front();
+    pending_play_queue.front().played = true;
+    return startPlayback(copy);
 }
 
 bool VoicetasticModule::playByMessageId(uint32_t message_id)
@@ -329,11 +336,11 @@ bool VoicetasticModule::playByMessageId(uint32_t message_id)
     if (playing) return false;
     if (rec_state != eRecIdle) return false;
     if (tx_active) return false;
-    for (auto it = pending_play_queue.begin(); it != pending_play_queue.end(); ++it) {
-        if (it->message_id == message_id) {
-            voicetastic::ReceivedVoiceMessage msg = std::move(*it);
-            pending_play_queue.erase(it);
-            return startPlayback(msg);
+    for (auto &m : pending_play_queue) {
+        if (m.message_id == message_id) {
+            voicetastic::ReceivedVoiceMessage copy = m;
+            m.played = true;
+            return startPlayback(copy);
         }
     }
     return false;
@@ -359,6 +366,21 @@ bool VoicetasticModule::peekPending(size_t index, NodeNum &from, uint32_t &messa
     from = m.from;
     message_id = m.message_id;
     approx_duration_ms = vtEstimateDurationMs(m);
+    return true;
+}
+
+bool VoicetasticModule::peekPendingFull(size_t index, NodeNum &from, NodeNum &to,
+                                        uint8_t &channel, uint32_t &message_id,
+                                        uint32_t &approx_duration_ms, bool &played) const
+{
+    if (index >= pending_play_queue.size()) return false;
+    const auto &m = pending_play_queue[index];
+    from = m.from;
+    to = m.to;
+    channel = m.channel;
+    message_id = m.message_id;
+    approx_duration_ms = vtEstimateDurationMs(m);
+    played = m.played;
     return true;
 }
 
@@ -581,7 +603,8 @@ ProcessMessage VoicetasticModule::handleReceived(const meshtastic_MeshPacket &mp
     // Hand the frame to the per-(from, message_id) assembler. It deals with
     // shard storage, chunk_size inference (spec §4), FEC reconstruction, and
     // queuing complete messages for playback (Phase 6).
-    if (assembler.acceptFrame(mp.from, h, p.payload.bytes + HEADER_SIZE, body_len)) {
+    if (assembler.acceptFrame(mp.from, mp.to, mp.channel, h,
+                              p.payload.bytes + HEADER_SIZE, body_len)) {
         // A new message was just completed. Phase 6 will drain the assembler's
         // complete-queue into the playback engine; for now we just leave it
         // sitting there so anyone polling popComplete() can pick it up.
@@ -619,6 +642,12 @@ int32_t VoicetasticModule::runOnce()
         LOG_INFO("Voicetastic: voice from 0x%08x queued for play (%u bytes)",
                  (unsigned)rxmsg.from, (unsigned)rxmsg.audio.size());
         pending_play_queue.push_back(std::move(rxmsg));
+        // Cap the inbox so a flood of voice messages doesn't OOM. ~16 entries
+        // at ~5 KB/30 s gives a worst-case 80 KB resident, comfortably inside
+        // our PSRAM/free-heap budget.
+        while (pending_play_queue.size() > kMaxInbox) {
+            pending_play_queue.erase(pending_play_queue.begin());
+        }
     }
 
 #ifdef VOICETASTIC_BOOT_MIC_TEST

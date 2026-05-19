@@ -34,6 +34,9 @@ class VoicetasticPacketClient : public PacketClient
     uint32_t  voicePlayMessageId() const override;
     bool      voicePlayPeek(size_t index, uint32_t &from, uint32_t &message_id,
                             uint32_t &approx_duration_ms) const override;
+    bool      voicePlayPeekFull(size_t index, uint32_t &from, uint32_t &to, uint8_t &channel,
+                                uint32_t &message_id, uint32_t &approx_duration_ms,
+                                bool &played) const override;
 
   private:
     // The chat screen calls voiceRecordStart() with the currently-selected
