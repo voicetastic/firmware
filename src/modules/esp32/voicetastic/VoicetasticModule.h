@@ -72,6 +72,19 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     // to Codec2 frames. The chat screen treats both as "REC..." for the user.
     bool isRecording() const { return rec_state != eRecIdle; }
 
+    // Codec2 bitrate selection. Per VOICE_PROTOCOL.md §3.2.2, all modes share
+    // the same wire framing — the mode is advertised in each frame's
+    // codec_param. Receivers (including this firmware's playback path) decode
+    // using the mode advertised on the wire, not their own outgoing setting,
+    // so setting this differently on each end is safe.
+    //
+    // Default is M_1200 (6 B/40ms = 1.2 kbps), the most LoRa-friendly mode.
+    // M_3200 produces noticeably better audio at the cost of ~5x airtime.
+    // M_1600 / M_1400 / M_1300 are interpolations. Use of M_700/M_700B would
+    // require updating MAX_PARITY / chunk_size guards, not exposed here.
+    voicetastic::Codec2Mode getCodec2Mode() const { return codec2_mode; }
+    void setCodec2Mode(voicetastic::Codec2Mode mode) { codec2_mode = mode; }
+
     // True when there's a captured-but-unsent audio buffer waiting to be sent.
     bool hasPending() const { return !pending_audio.empty(); }
 
@@ -104,6 +117,15 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     uint32_t boot_ms = 0;
 
     uint8_t  stream_seq_counter = 0;
+
+    // Active outbound codec2 mode. Initialised from the build flag
+    // VOICETASTIC_CODEC2_MODE (default M_1200) and mutable at runtime via
+    // setCodec2Mode(); receivers always honour each frame's codec_param so
+    // the two ends don't need to agree out-of-band.
+#ifndef VOICETASTIC_CODEC2_MODE
+#define VOICETASTIC_CODEC2_MODE voicetastic::Codec2Mode::M_1200
+#endif
+    voicetastic::Codec2Mode codec2_mode = VOICETASTIC_CODEC2_MODE;
 
     // SD-buffered recording state.
     //

@@ -29,7 +29,7 @@ static void runProtocolSelfTest()
     h.mac_keyed      = false;
     h.message_id     = 0xDEADBEEF;
     h.codec          = CodecId::CODEC2;
-    h.codec_param    = (uint8_t)Codec2Mode::M_1200;
+    h.codec_param    = (uint8_t)Codec2Mode::M_1200; // self-test only; any valid mode is fine
     h.stream_seq     = 7;
     h.chunk_index    = 3;
     h.total_data     = 22;
@@ -170,7 +170,7 @@ bool VoicetasticModule::sendPending(NodeNum to, uint8_t /*channel*/)
     pending_audio.shrink_to_fit();
     if (audio.empty()) return false;
     return enqueueOutbound(audio.data(), audio.size(),
-                           CodecId::CODEC2, (uint8_t)Codec2Mode::M_1200, to);
+                           CodecId::CODEC2, (uint8_t)codec2_mode, to);
 }
 
 void VoicetasticModule::discardPending()
@@ -192,8 +192,8 @@ void VoicetasticModule::stopRecording()
     const size_t pcm_bytes = FSCom.exists(VT_PCM_PATH) ? (size_t)FSCom.open(VT_PCM_PATH, FILE_READ).size() : 0;
     enc_frames_total = (uint32_t)(pcm_bytes / VT_PCM_BYTES_PER_FRAME);
     enc_frames_done  = 0;
-    LOG_INFO("Voicetastic: captured %u PCM bytes (%u frames); encoding to Codec2 mode 3200",
-             (unsigned)pcm_bytes, (unsigned)enc_frames_total);
+    LOG_INFO("Voicetastic: captured %u PCM bytes (%u frames); encoding to Codec2 mode ord=%u",
+             (unsigned)pcm_bytes, (unsigned)enc_frames_total, (unsigned)codec2_mode);
 
     // NB: do NOT call VtAudio::deinitMic() here. Tearing the ES7210 down via
     // I2C while the LVGL keyboard task is polling the TCA8418 on the same
@@ -206,7 +206,7 @@ void VoicetasticModule::stopRecording()
         rec_state = eRecIdle;
         return;
     }
-    if (!VtAudio::initEncoder(Codec2Mode::M_1200)) {
+    if (!VtAudio::initEncoder(codec2_mode)) {
         LOG_ERROR("Voicetastic: codec2 init failed at encoding phase");
         if (FSCom.exists(VT_PCM_PATH)) FSCom.remove(VT_PCM_PATH);
         rec_state = eRecIdle;
