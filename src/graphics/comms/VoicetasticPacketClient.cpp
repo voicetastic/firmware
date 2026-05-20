@@ -50,6 +50,19 @@ uint32_t VoicetasticPacketClient::voiceRecordElapsedMs() const
     return voicetasticModule->recordElapsedMs();
 }
 
+uint8_t VoicetasticPacketClient::voiceGetCodec2Mode() const
+{
+    if (voicetasticModule == nullptr) return 5; // M_1200 default
+    return (uint8_t)voicetasticModule->getCodec2Mode();
+}
+
+void VoicetasticPacketClient::voiceSetCodec2Mode(uint8_t mode)
+{
+    if (voicetasticModule == nullptr) return;
+    if (mode > 5) return; // clamp to the valid Codec2Mode enum range
+    voicetasticModule->setCodec2Mode((voicetastic::Codec2Mode)mode);
+}
+
 // ---------- Mini-player ----------
 
 size_t VoicetasticPacketClient::voicePlayPendingCount() const

@@ -22,6 +22,9 @@ class VoicetasticPacketClient : public PacketClient
     VoiceState voiceRecordState() const override;
     uint32_t  voiceRecordElapsedMs() const override;
 
+    uint8_t   voiceGetCodec2Mode() const override;
+    void      voiceSetCodec2Mode(uint8_t mode) override;
+
     // Mini-player.
     size_t    voicePlayPendingCount() const override;
     bool      voicePlayNext() override;
