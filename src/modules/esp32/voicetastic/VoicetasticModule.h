@@ -83,7 +83,9 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     // M_1600 / M_1400 / M_1300 are interpolations. Use of M_700/M_700B would
     // require updating MAX_PARITY / chunk_size guards, not exposed here.
     voicetastic::Codec2Mode getCodec2Mode() const { return codec2_mode; }
-    void setCodec2Mode(voicetastic::Codec2Mode mode) { codec2_mode = mode; }
+    // Set and persist the encode mode in NVS so it survives reboot. The next
+    // outbound recording uses the new mode; in-flight TX is unaffected.
+    void setCodec2Mode(voicetastic::Codec2Mode mode);
 
 
     // Mini-player API. Received voice messages no longer auto-play; instead

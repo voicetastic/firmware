@@ -11,8 +11,14 @@
 #include "concurrency/LockGuard.h"
 #include "rs/rs.h"
 #include <Arduino.h>
+#include <Preferences.h>
 #include <esp_random.h>
 #include <string.h>
+
+// NVS namespace + key for the persisted Codec2 encode mode. Namespace must be
+// ≤ 15 chars and key ≤ 15 chars (ESP-IDF NVS limit).
+static constexpr const char *VT_NVS_NAMESPACE = "voicetastic";
+static constexpr const char *VT_NVS_KEY_C2MODE = "c2mode";
 
 VoicetasticModule *voicetasticModule;
 
@@ -62,9 +68,38 @@ VoicetasticModule::VoicetasticModule()
     : SinglePortModule("Voicetastic", meshtastic_PortNum_PRIVATE_APP), concurrency::OSThread("Voicetastic")
 {
     LOG_INFO("Voicetastic module init (port=%d, scope=TX+RX Codec2 plaintext+FEC)", (int)meshtastic_PortNum_PRIVATE_APP);
+    // Restore the user-selected Codec2 mode from NVS, falling back to the
+    // build-flag default (codec2_mode's in-class initializer) when nothing
+    // has been saved yet.
+    {
+        Preferences prefs;
+        if (prefs.begin(VT_NVS_NAMESPACE, /*readOnly=*/true)) {
+            const uint8_t fallback = (uint8_t)codec2_mode;
+            const uint8_t stored = prefs.getUChar(VT_NVS_KEY_C2MODE, fallback);
+            prefs.end();
+            // Clamp to the valid enum range (M_3200..M_1200 = 0..5).
+            if (stored <= (uint8_t)voicetastic::Codec2Mode::M_1200) {
+                codec2_mode = (voicetastic::Codec2Mode)stored;
+                LOG_INFO("Voicetastic: codec2 mode restored from NVS = %u", (unsigned)stored);
+            }
+        }
+    }
     runProtocolSelfTest();
     voicetastic::rs::runSelfTest();
     boot_ms = millis();
+}
+
+void VoicetasticModule::setCodec2Mode(voicetastic::Codec2Mode mode)
+{
+    codec2_mode = mode;
+    Preferences prefs;
+    if (prefs.begin(VT_NVS_NAMESPACE, /*readOnly=*/false)) {
+        prefs.putUChar(VT_NVS_KEY_C2MODE, (uint8_t)mode);
+        prefs.end();
+        LOG_INFO("Voicetastic: codec2 mode persisted = %u", (unsigned)mode);
+    } else {
+        LOG_WARN("Voicetastic: NVS open failed; codec2 mode not persisted");
+    }
 }
 
 bool VoicetasticModule::enqueueOutbound(const uint8_t *audio, size_t audio_len,
