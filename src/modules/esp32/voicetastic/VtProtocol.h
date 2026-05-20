@@ -102,6 +102,27 @@ bool decodeHeader(const uint8_t in[HEADER_SIZE], VtHeader &out,
 void computeHeaderMac(const uint8_t header12[12], uint8_t out_tag[MAC_TAG_SIZE],
                       const uint8_t *mac_key = nullptr, size_t mac_key_len = 0);
 
+// NACK body wire format (spec §3.4).
+//   byte 0:       nack_version = 0x01
+//   byte 1:       flags (bit 0 = give_up; bits 1..7 reserved, must be 0)
+//   bytes 2..:    bitmap of missing chunk indices, ceil(total_data/8) bytes,
+//                 MSB-first per byte (bit 0 of byte 2 = chunk 0).
+static constexpr uint8_t NACK_VERSION   = 0x01;
+static constexpr uint8_t NACK_FLAG_GIVE_UP = 0x01;
+
+// Encode a NACK body into `out` (capacity `out_max`). `missing` is a length
+// `total_data` array; bit `i` set ⇒ chunk index `i` is missing. Returns the
+// number of bytes written, or 0 on buffer overflow / bad args.
+size_t encodeNackBody(uint8_t total_data, const bool *missing, bool give_up,
+                      uint8_t *out, size_t out_max);
+
+// Parse a NACK body. `total_data` MUST be the value echoed from the originating
+// stream's header so the caller knows the bitmap width. Returns true on success
+// and fills `missing_out` (length `total_data`) plus `give_up_out`. False on
+// malformed body (wrong version, reserved-bit set, undersized buffer).
+bool decodeNackBody(const uint8_t *body, size_t body_len, uint8_t total_data,
+                    bool *missing_out, bool &give_up_out);
+
 // Debug helper: dump a header in human-readable form to the log.
 void logHeader(const char *prefix, const VtHeader &h);
 

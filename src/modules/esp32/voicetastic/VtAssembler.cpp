@@ -49,6 +49,8 @@ void VtAssembler::resetSlot(AssemblyState &s)
     s.last_data_real_size = 0;
     s.last_data_seen = false;
     s.received_data_count = 0;
+    s.last_chunk_ms = 0;
+    s.nack_rounds = 0;
     s.data_shards.clear();
     s.parity_shards.clear();
     s.data_received.clear();
@@ -130,7 +132,9 @@ bool VtAssembler::acceptFrame(NodeNum from, NodeNum to, uint8_t channel,
     AssemblyState *s = findExisting(from, h.message_id);
     if (s == nullptr) {
         s = allocateSlot(from, h.message_id);
-        s->started_ms = millis();
+        s->started_ms = now_ms;
+        s->last_chunk_ms = now_ms;
+        s->nack_rounds = 0;
         s->to = to;
         s->channel = channel;
         s->codec = h.codec;
@@ -156,6 +160,8 @@ bool VtAssembler::acceptFrame(NodeNum from, NodeNum to, uint8_t channel,
         // handle late retransmits adding new parity rows, so just reject shrinks.
         if (h.parity_count < s->parity_count) return false;
     }
+    // Any accepted frame extends the quiet window — NACK timer restarts.
+    s->last_chunk_ms = now_ms;
 
     // Infer chunk_size from the first PARITY frame or any non-final DATA frame
     // whose body length is unambiguous (spec §4).
@@ -331,6 +337,50 @@ void VtAssembler::tick(uint32_t now_ms)
             resetSlot(s);
         }
     }
+}
+
+bool VtAssembler::pollPendingNack(PendingNack &out, uint32_t now_ms)
+{
+    for (auto &s : states_) {
+        if (!s.in_use) continue;
+        // Need to know total_data and have at least one missing chunk to NACK.
+        if (s.received_data_count == s.total_data) continue;
+        if ((now_ms - s.last_chunk_ms) < NACK_QUIET_MS) continue;
+
+        const bool exhausted = (s.nack_rounds >= NACK_MAX_ROUNDS);
+
+        out.from         = s.from;
+        out.to           = s.to;
+        out.channel      = s.channel;
+        out.message_id   = s.message_id;
+        out.codec        = s.codec;
+        out.codec_param  = s.codec_param;
+        out.stream_seq   = s.stream_seq;
+        out.total_data   = s.total_data;
+        out.parity_count = s.parity_count;
+        out.give_up      = exhausted;
+        out.missing.assign(s.total_data, false);
+        for (uint8_t i = 0; i < s.total_data; ++i) {
+            out.missing[i] = !s.data_received[i];
+        }
+
+        if (exhausted) {
+            LOG_WARN("vtAssembler: mid=%08x NACK rounds exhausted, giving up at %u/%u",
+                     (unsigned)s.message_id, (unsigned)s.received_data_count,
+                     (unsigned)s.total_data);
+            // Finalize partial: blacklist + drop state. We still emit one final
+            // give_up NACK so the sender can stop draining its queue.
+            addToBlacklist(s.from, s.message_id, now_ms);
+            resetSlot(s);
+        } else {
+            s.nack_rounds++;
+            // Restart the quiet timer so we don't immediately re-NACK on the
+            // next tick before the sender has a chance to respond.
+            s.last_chunk_ms = now_ms;
+        }
+        return true;
+    }
+    return false;
 }
 
 } // namespace voicetastic

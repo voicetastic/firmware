@@ -27,10 +27,10 @@ struct ReceivedVoiceMessage {
     std::vector<uint8_t> audio;    // reassembled codec frame bytes (no container)
 };
 
-// Per-(from, message_id) reassembly state machine, scoped down from spec §9
-// for our MVP: no NACK round-trips, no global blacklist, just enough to
-// recover messages whose loss falls inside parity_count and to time out
-// stuck assemblies.
+// Per-(from, message_id) reassembly state machine. Implements the data-path
+// of spec §9: chunk_size inference, FEC recovery, partial-timeout, and the
+// quiet-window NACK loop (RX-side emission only — the TX side wires inbound
+// NACKs into the module's send queue).
 class VtAssembler {
   public:
     VtAssembler() = default;
@@ -52,10 +52,44 @@ class VtAssembler {
     size_t inProgressCount() const;
     size_t completeQueueDepth() const { return complete_count; }
 
+    // Pending NACK to emit on behalf of an in-progress assembly that has been
+    // quiet for ≥ NACK_QUIET_MS and still has missing data shards. The caller
+    // (VoicetasticModule) builds a v2 NACK frame from these fields, paces it
+    // per modem preset, and ships it via service->sendToMesh. Fields mirror
+    // the originating message so the sender can route it back to its active
+    // TX state.
+    struct PendingNack {
+        NodeNum   from = 0;       // recipient of the NACK (the original sender)
+        NodeNum   to = 0;         // local node — echoed back as the NACK frame's `to`
+        uint8_t   channel = 0;
+        uint32_t  message_id = 0;
+        CodecId   codec = CodecId::CODEC2;
+        uint8_t   codec_param = 0;
+        uint8_t   stream_seq = 0;
+        uint8_t   total_data = 0;
+        uint8_t   parity_count = 0;
+        bool      give_up = false; // set if NACK_MAX_ROUNDS exhausted
+        std::vector<bool> missing; // length total_data; bit i ⇒ chunk i missing
+    };
+
+    // Returns true and fills `out` if any in-progress assembly is ready to
+    // NACK. Mutates the assembly's nack-tracking state (rounds, last_chunk_ms)
+    // as a side effect so the same assembly is not re-emitted on the next tick.
+    // Caller is expected to send the resulting frame.
+    bool pollPendingNack(PendingNack &out, uint32_t now_ms);
+
   private:
     static constexpr int  MAX_IN_PROGRESS = 4;        // per-sender * 1 sender in MVP
     static constexpr int  MAX_COMPLETE_QUEUE = 4;     // recent received messages
-    static constexpr uint32_t TIMEOUT_MS = 30000;     // drop a stuck assembly after 30 s
+    static constexpr uint32_t TIMEOUT_MS = 30000;     // absolute drop-dead for a stuck assembly
+
+    // NACK loop (spec §9). After NACK_QUIET_MS of silence on an in-progress
+    // assembly with missing shards we emit a NACK; we retry up to NACK_MAX_ROUNDS
+    // times before giving up and finalizing partial. Numbers are smaller than
+    // the desktop's defaults (3000ms / 400 rounds) to fit embedded heuristics:
+    // the in-progress timeout above caps total time regardless.
+    static constexpr uint32_t NACK_QUIET_MS   = 3000;
+    static constexpr uint16_t NACK_MAX_ROUNDS = 8;
 
     // Completion-memory blacklist (spec §9.1). After we finalize a message —
     // complete OR partial-timeout — we remember (from, message_id) for
@@ -94,6 +128,8 @@ class VtAssembler {
         bool       last_data_seen;
         uint8_t    received_data_count;
         uint32_t   started_ms;
+        uint32_t   last_chunk_ms;          // millis() of the last accepted DATA/PARITY frame; drives NACK quiet timer
+        uint16_t   nack_rounds;            // NACKs already emitted for this assembly (capped at NACK_MAX_ROUNDS)
         std::vector<std::vector<uint8_t>> data_shards;    // [total_data][chunk_size]
         std::vector<std::vector<uint8_t>> parity_shards;  // [parity_count][chunk_size]
         std::vector<bool> data_received;                  // [total_data]

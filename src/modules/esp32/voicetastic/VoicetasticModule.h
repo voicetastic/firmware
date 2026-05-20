@@ -134,6 +134,14 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     NodeNum  tx_to = NODENUM_BROADCAST;
     uint8_t  tx_channel = 0;          // Meshtastic channel index for the outbound message;
                                       // also drives the channel PSK lookup that keys the header MAC.
+    // NACK loop state. After the linear walk completes we keep tx_msg state
+    // alive for TX_NACK_LINGER_MS so we can answer inbound NACKs by replaying
+    // the missing data chunks. Retransmit queue is drained ahead of the linear
+    // walk in sendOneChunk; once it empties and the linger expires, tx_active
+    // is cleared.
+    static constexpr uint32_t TX_NACK_LINGER_MS = 8000;
+    std::vector<uint8_t> tx_retransmit_idx;  // FIFO of data chunk indices to re-send
+    uint32_t tx_linger_until_ms = 0;         // 0 while still inside the linear walk
 
     // Boot-time test broadcast: sent once a few seconds after boot to verify
     // the wire pipeline against voicetastic-desktop receivers. Phase 4 will
@@ -211,6 +219,17 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     voicetastic::VtAssembler assembler;
 
     void sendOneChunk();
+    // Re-send a specific DATA shard (used for NACK-driven retransmits). Same
+    // header/MAC/body path as sendOneChunk; chunk_index is the data index
+    // (0..total_data-1).
+    void sendDataRetransmit(uint8_t data_idx);
+    // Build + send one DATA or PARITY frame from tx_msg state. Shared between
+    // the linear-walk path (sendOneChunk) and the NACK retransmit path
+    // (sendDataRetransmit).
+    void txSendShard(bool is_data, uint8_t idx, bool last_in_stream);
+    // Send a NACK frame from the receiver side. Echoes the originating
+    // message's identity fields per spec §3.4.
+    void sendNack(const voicetastic::VtAssembler::PendingNack &nk);
     void recordFrame();   // PCM read -> FSCom write; called from runOnce in eRecRecording
 };
 

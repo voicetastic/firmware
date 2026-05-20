@@ -144,6 +144,46 @@ bool decodeHeader(const uint8_t in[HEADER_SIZE], VtHeader &out,
     return true;
 }
 
+size_t encodeNackBody(uint8_t total_data, const bool *missing, bool give_up,
+                      uint8_t *out, size_t out_max)
+{
+    if (total_data == 0 || missing == nullptr || out == nullptr) return 0;
+    const size_t bitmap_len = ((size_t)total_data + 7u) / 8u;
+    const size_t needed = 2 + bitmap_len;
+    if (out_max < needed) return 0;
+
+    out[0] = NACK_VERSION;
+    out[1] = give_up ? NACK_FLAG_GIVE_UP : 0;
+    // MSB-first per byte: bit 0 of byte 2 = chunk 0.
+    memset(out + 2, 0, bitmap_len);
+    for (uint8_t i = 0; i < total_data; ++i) {
+        if (missing[i]) {
+            const size_t byte_off = 2 + (i / 8);
+            const uint8_t bit = (uint8_t)(0x80u >> (i % 8));
+            out[byte_off] |= bit;
+        }
+    }
+    return needed;
+}
+
+bool decodeNackBody(const uint8_t *body, size_t body_len, uint8_t total_data,
+                    bool *missing_out, bool &give_up_out)
+{
+    if (body == nullptr || missing_out == nullptr || total_data == 0) return false;
+    const size_t bitmap_len = ((size_t)total_data + 7u) / 8u;
+    if (body_len < 2 + bitmap_len) return false;
+    if (body[0] != NACK_VERSION) return false;
+    if ((body[1] & ~NACK_FLAG_GIVE_UP) != 0) return false; // reserved bits
+
+    give_up_out = (body[1] & NACK_FLAG_GIVE_UP) != 0;
+    for (uint8_t i = 0; i < total_data; ++i) {
+        const size_t byte_off = 2 + (i / 8);
+        const uint8_t bit = (uint8_t)(0x80u >> (i % 8));
+        missing_out[i] = (body[byte_off] & bit) != 0;
+    }
+    return true;
+}
+
 void logHeader(const char *prefix, const VtHeader &h)
 {
     const char *type_str =

@@ -144,6 +144,8 @@ bool VoicetasticModule::enqueueOutbound(const uint8_t *audio, size_t audio_len,
 
     tx_to = to;
     tx_channel = channel;
+    tx_retransmit_idx.clear();
+    tx_linger_until_ms = 0;
     tx_next_chunk = 0;
     tx_paced_until_ms = 0;
     tx_active = true;
@@ -578,23 +580,38 @@ void VoicetasticModule::recordFrame()
 void VoicetasticModule::sendOneChunk()
 {
     using namespace voicetastic;
-    const uint16_t idx = tx_next_chunk;
-    const bool is_data = idx < tx_msg.total_data;
-    const uint16_t parity_idx = is_data ? 0 : (idx - tx_msg.total_data);
+    const uint16_t walked = tx_next_chunk;
+    const bool is_data = walked < tx_msg.total_data;
+    const uint8_t  idx = is_data ? (uint8_t)walked : (uint8_t)(walked - tx_msg.total_data);
     const bool is_last_in_stream =
-        (uint16_t)(idx + 1) == (uint16_t)tx_msg.total_data + (uint16_t)tx_msg.parity_count;
+        (uint16_t)(walked + 1) == (uint16_t)tx_msg.total_data + (uint16_t)tx_msg.parity_count;
+    txSendShard(is_data, idx, is_last_in_stream);
+}
+
+void VoicetasticModule::sendDataRetransmit(uint8_t data_idx)
+{
+    using namespace voicetastic;
+    if (data_idx >= tx_msg.total_data) return;
+    // NACK-driven retransmits ride the same wire path; we leave last_in_stream
+    // clear since the original linear walk's terminal frame already carried it.
+    txSendShard(/*is_data=*/true, data_idx, /*last_in_stream=*/false);
+}
+
+void VoicetasticModule::txSendShard(bool is_data, uint8_t idx, bool last_in_stream)
+{
+    using namespace voicetastic;
 
     VtHeader h{};
     h.version        = PROTOCOL_VERSION;
     h.packet_type    = is_data ? PacketType::DATA : PacketType::PARITY;
     h.encrypted      = false;
-    h.last_in_stream = is_last_in_stream;
+    h.last_in_stream = last_in_stream;
     h.mac_keyed      = false; // overwritten by encodeHeader based on the key arg
     h.message_id     = tx_msg.message_id;
     h.codec          = tx_msg.codec;
     h.codec_param    = tx_msg.codec_param;
     h.stream_seq     = tx_msg.stream_seq;
-    h.chunk_index    = is_data ? (uint8_t)idx : (uint8_t)parity_idx;
+    h.chunk_index    = idx;
     h.total_data     = tx_msg.total_data;
     h.parity_count   = tx_msg.parity_count;
 
@@ -614,14 +631,14 @@ void VoicetasticModule::sendOneChunk()
     }
 
     // Determine body size: trimmed for final DATA, full for all others.
-    const std::vector<uint8_t> &src = is_data ? tx_msg.data[idx] : tx_msg.parity[parity_idx];
+    const std::vector<uint8_t> &src = is_data ? tx_msg.data[idx] : tx_msg.parity[idx];
     const size_t body_len =
         (is_data && idx == tx_msg.total_data - 1) ? tx_msg.last_data_real_size : (size_t)tx_msg.chunk_size;
 
     meshtastic_MeshPacket *p = allocDataPacket();
     p->to = tx_to;
     p->channel = tx_channel;
-    p->want_ack = false; // no NACK loop in this build
+    p->want_ack = false;
     p->decoded.want_response = false;
     p->priority = meshtastic_MeshPacket_Priority_DEFAULT;
 
@@ -640,6 +657,74 @@ void VoicetasticModule::sendOneChunk()
     LOG_DEBUG("Voicetastic: tx mid=%08x %s ci=%u/%u body=%u",
               (unsigned)h.message_id, is_data ? "D" : "P",
               (unsigned)h.chunk_index, (unsigned)tx_msg.total_data, (unsigned)body_len);
+    service->sendToMesh(p);
+}
+
+void VoicetasticModule::sendNack(const voicetastic::VtAssembler::PendingNack &nk)
+{
+    using namespace voicetastic;
+
+    VtHeader h{};
+    h.version        = PROTOCOL_VERSION;
+    h.packet_type    = PacketType::NACK;
+    h.encrypted      = false;     // spec §3.4: NACKs MUST NOT use the GCM envelope
+    h.last_in_stream = false;
+    h.mac_keyed      = false;
+    h.message_id     = nk.message_id;
+    h.codec          = nk.codec;
+    h.codec_param    = nk.codec_param;
+    h.stream_seq     = nk.stream_seq;
+    h.chunk_index    = 0;         // spec §3.4
+    h.total_data     = nk.total_data;
+    h.parity_count   = nk.parity_count;
+
+    uint8_t psk_buf[32] = {0};
+    size_t  psk_len = 0;
+    resolveChannelPsk(nk.channel, psk_buf, psk_len);
+    const uint8_t *mac_key  = (psk_len > 0) ? psk_buf : nullptr;
+    const size_t   mac_klen = psk_len;
+
+    uint8_t header_buf[HEADER_SIZE] = {0};
+    if (encodeHeader(h, header_buf, mac_key, mac_klen) != HEADER_SIZE) {
+        LOG_ERROR("Voicetastic: NACK header encode failed (mid=%08x)", (unsigned)nk.message_id);
+        return;
+    }
+
+    // Body: spec §3.4.
+    uint8_t body_buf[2 + ((255u + 7u) / 8u)] = {0};
+    // Convert vector<bool> to a plain bool array for encodeNackBody.
+    bool missing_buf[255] = {false};
+    for (uint8_t i = 0; i < nk.total_data; ++i) missing_buf[i] = nk.missing[i];
+    const size_t body_len = encodeNackBody(nk.total_data, missing_buf, nk.give_up,
+                                           body_buf, sizeof(body_buf));
+    if (body_len == 0) {
+        LOG_ERROR("Voicetastic: NACK body encode failed (mid=%08x total=%u)",
+                  (unsigned)nk.message_id, (unsigned)nk.total_data);
+        return;
+    }
+
+    meshtastic_MeshPacket *p = allocDataPacket();
+    p->to = nk.from;          // back to the original sender
+    p->channel = nk.channel;
+    p->want_ack = false;      // spec §3.4
+    p->decoded.want_response = false;
+    p->priority = meshtastic_MeshPacket_Priority_DEFAULT;
+
+    const size_t total = HEADER_SIZE + body_len;
+    if (total > sizeof(p->decoded.payload.bytes)) {
+        p->decoded.payload.size = 0;
+        return;
+    }
+    memcpy(p->decoded.payload.bytes, header_buf, HEADER_SIZE);
+    memcpy(p->decoded.payload.bytes + HEADER_SIZE, body_buf, body_len);
+    p->decoded.payload.size = total;
+
+    // Count missing for the log line.
+    unsigned nmiss = 0;
+    for (uint8_t i = 0; i < nk.total_data; ++i) if (nk.missing[i]) nmiss++;
+    LOG_INFO("Voicetastic: NACK mid=%08x to=0x%08x missing=%u/%u%s",
+             (unsigned)nk.message_id, (unsigned)nk.from, nmiss, (unsigned)nk.total_data,
+             nk.give_up ? " give_up" : "");
     service->sendToMesh(p);
 }
 
@@ -675,9 +760,59 @@ ProcessMessage VoicetasticModule::handleReceived(const meshtastic_MeshPacket &mp
     snprintf(prefix, sizeof(prefix), "rx from=0x%08x body=%u", (unsigned)mp.from, (unsigned)body_len);
     logHeader(prefix, h);
 
-    // Hand the frame to the per-(from, message_id) assembler. It deals with
-    // shard storage, chunk_size inference (spec §4), FEC reconstruction, and
-    // queuing complete messages for playback (Phase 6).
+    // Inbound NACK: route to the active TX state. We don't carry per-channel TX
+    // state — there's only one outbound message in flight at a time — so we
+    // match purely by message_id.
+    if (h.packet_type == PacketType::NACK) {
+        if (!tx_active || tx_msg.message_id != h.message_id) {
+            LOG_DEBUG("Voicetastic: NACK for mid=%08x ignored (no matching TX)",
+                      (unsigned)h.message_id);
+            return ProcessMessage::CONTINUE;
+        }
+        if (h.total_data != tx_msg.total_data) {
+            LOG_WARN("Voicetastic: NACK mid=%08x rejected (total_data drift %u vs %u)",
+                     (unsigned)h.message_id, (unsigned)h.total_data, (unsigned)tx_msg.total_data);
+            return ProcessMessage::CONTINUE;
+        }
+        bool missing_buf[255] = {false};
+        bool give_up = false;
+        if (!decodeNackBody(p.payload.bytes + HEADER_SIZE, body_len,
+                            h.total_data, missing_buf, give_up)) {
+            LOG_WARN("Voicetastic: NACK body decode failed (mid=%08x body=%u)",
+                     (unsigned)h.message_id, (unsigned)body_len);
+            return ProcessMessage::CONTINUE;
+        }
+        if (give_up) {
+            LOG_INFO("Voicetastic: NACK give_up mid=%08x — aborting TX",
+                     (unsigned)h.message_id);
+            tx_active = false;
+            tx_retransmit_idx.clear();
+            tx_msg.data.clear();
+            tx_msg.parity.clear();
+            return ProcessMessage::CONTINUE;
+        }
+        // Append missing data chunks to the retransmit queue, skipping ones
+        // already pending so a chatty NACK loop doesn't compound airtime.
+        unsigned added = 0;
+        for (uint8_t i = 0; i < h.total_data; ++i) {
+            if (!missing_buf[i]) continue;
+            bool already = false;
+            for (uint8_t q : tx_retransmit_idx) {
+                if (q == i) { already = true; break; }
+            }
+            if (!already) { tx_retransmit_idx.push_back(i); added++; }
+        }
+        // Extend the linger window to keep tx_msg state alive long enough to
+        // service the new retransmits.
+        tx_linger_until_ms = millis() + TX_NACK_LINGER_MS;
+        LOG_INFO("Voicetastic: NACK mid=%08x queued %u retransmits (queue=%u)",
+                 (unsigned)h.message_id, added, (unsigned)tx_retransmit_idx.size());
+        return ProcessMessage::CONTINUE;
+    }
+
+    // Hand DATA / PARITY frames to the per-(from, message_id) assembler. It
+    // deals with shard storage, chunk_size inference (spec §4), FEC
+    // reconstruction, and queuing complete messages for playback (Phase 6).
     if (assembler.acceptFrame(mp.from, mp.to, mp.channel, h,
                               p.payload.bytes + HEADER_SIZE, body_len)) {
         // A new message was just completed. Phase 6 will drain the assembler's
@@ -692,9 +827,15 @@ int32_t VoicetasticModule::runOnce()
     using namespace voicetastic;
     const uint32_t now = millis();
 
-    // Time out stuck inbound assemblies (no NACK loop in this build, so we
-    // can't recover them; drop them so they don't leak.)
+    // Time out stuck inbound assemblies (absolute deadline) and check for
+    // chunks ready to NACK on the quiet-window timer.
     assembler.tick(now);
+    {
+        VtAssembler::PendingNack nk;
+        if (assembler.pollPendingNack(nk, now)) {
+            sendNack(nk);
+        }
+    }
 
     // Playback lifecycle. If a worker task is running, wait for it; on
     // completion, clear state. Drain new assembler completions into our own
@@ -767,15 +908,28 @@ int32_t VoicetasticModule::runOnce()
 
     if (!tx_active) return 500;
 
-    // Done?
     const uint16_t total_chunks = (uint16_t)tx_msg.total_data + (uint16_t)tx_msg.parity_count;
-    if (tx_next_chunk >= total_chunks) {
-        LOG_INFO("Voicetastic: TX complete mid=%08x (%u chunks)",
-                 (unsigned)tx_msg.message_id, (unsigned)total_chunks);
-        tx_active = false;
-        // Release the shard buffers so we don't hold ~tens of KB indefinitely.
-        tx_msg.data.clear(); tx_msg.parity.clear();
-        return 500;
+    const bool linear_walk_done = (tx_next_chunk >= total_chunks);
+
+    // Done? Linear walk complete AND no retransmits queued AND the NACK linger
+    // window has elapsed → tear down TX state.
+    if (linear_walk_done && tx_retransmit_idx.empty()) {
+        if (tx_linger_until_ms == 0) {
+            // Just finished the linear walk; start the linger so we can still
+            // answer late NACKs (spec §8: NACK loop).
+            tx_linger_until_ms = now + TX_NACK_LINGER_MS;
+            LOG_INFO("Voicetastic: TX walk complete mid=%08x, linger %u ms for NACKs",
+                     (unsigned)tx_msg.message_id, (unsigned)TX_NACK_LINGER_MS);
+        } else if ((int32_t)(now - tx_linger_until_ms) >= 0) {
+            LOG_INFO("Voicetastic: TX teardown mid=%08x (%u chunks)",
+                     (unsigned)tx_msg.message_id, (unsigned)total_chunks);
+            tx_active = false;
+            tx_linger_until_ms = 0;
+            tx_msg.data.clear(); tx_msg.parity.clear();
+            return 500;
+        }
+        // Still inside linger window; idle but ready to react to NACKs.
+        return 100;
     }
 
     // Pacing window not yet elapsed?
@@ -789,8 +943,16 @@ int32_t VoicetasticModule::runOnce()
         return 100;
     }
 
-    sendOneChunk();
-    tx_next_chunk++;
+    // Retransmits ride ahead of the linear walk so NACKed chunks reach the
+    // receiver before we finish parity and tear down.
+    if (!tx_retransmit_idx.empty()) {
+        const uint8_t idx = tx_retransmit_idx.front();
+        tx_retransmit_idx.erase(tx_retransmit_idx.begin());
+        sendDataRetransmit(idx);
+    } else {
+        sendOneChunk();
+        tx_next_chunk++;
+    }
     const auto preset = (meshtastic_Config_LoRaConfig_ModemPreset)config.lora.modem_preset;
     tx_paced_until_ms = now + pacingMsForPreset(preset);
 
