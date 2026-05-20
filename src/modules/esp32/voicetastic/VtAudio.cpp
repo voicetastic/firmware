@@ -68,12 +68,16 @@ bool VtAudio::initMic()
         LOG_ERROR("VtAudio: es7210_adc_config_i2s failed");
         return false;
     }
-    // Per LilyGo's T-Deck mic example: route the actual mic input through
-    // MIC3+MIC4 with high gain; MIC1+MIC2 are kept at unity to avoid noise.
-    es7210_adc_set_gain((es7210_input_mics_t)(ES7210_INPUT_MIC1 | ES7210_INPUT_MIC2),
-                        (es7210_gain_value_t)GAIN_0DB);
-    es7210_adc_set_gain((es7210_input_mics_t)(ES7210_INPUT_MIC3 | ES7210_INPUT_MIC4),
-                        (es7210_gain_value_t)GAIN_37_5DB);
+    // ES7210 routes ADC1/ADC2 to SDOUT1 and ADC3/ADC4 to SDOUT2 (see
+    // es7210_config_fmt: REG12=0x00). Only SDOUT1 is wired to the ESP32
+    // (ES7210_DIN = GPIO 14), so even though the LilyGo example documents
+    // the mic on MIC3+MIC4 with 37.5 dB gain there, those samples never
+    // reach us — we're physically reading MIC1+MIC2 on the SDOUT1 pin.
+    // Apply the same 37.5 dB gain across all four mic preamps so whichever
+    // pair carries the actual mic ends up audible. The unused side just
+    // amplifies its own noise floor by ~5 dB more, which Codec2 handles
+    // fine since it's narrowband-speech-tuned.
+    es7210_adc_set_gain_all((es7210_gain_value_t)GAIN_37_5DB);
     if (es7210_adc_ctrl_state(cfg.codec_mode, AUDIO_HAL_CTRL_START) != ESP_OK) {
         LOG_ERROR("VtAudio: es7210_adc_ctrl_state(START) failed");
         return false;
