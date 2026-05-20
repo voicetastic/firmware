@@ -28,11 +28,13 @@ int16_t s_scratch[kScratchMax];
 
 // Codec2 encoder state. NULL when closed.
 struct CODEC2 *s_codec2 = nullptr;
+Codec2Mode s_codec2_mode = Codec2Mode::M_1200;
 int s_codec2_samples = 0;
 int s_codec2_bytes   = 0;
 
 // Codec2 decoder state (independent of encoder). NULL when closed.
 struct CODEC2 *s_codec2_dec = nullptr;
+Codec2Mode s_codec2_dec_mode = Codec2Mode::M_1200;
 int s_codec2_dec_samples = 0;
 int s_codec2_dec_bytes   = 0;
 
@@ -170,12 +172,20 @@ size_t VtAudio::readPcm(int16_t *out, size_t max_samples, uint32_t timeout_ms)
 
 bool VtAudio::initEncoder(Codec2Mode mode)
 {
-    if (s_codec2 != nullptr) return true;  // idempotent
+    if (s_codec2 != nullptr) {
+        if (s_codec2_mode == mode) return true;  // already at the requested mode
+        // Mode changed (e.g. user picked a different bitrate in the UI). Tear
+        // down the live encoder before creating a fresh one — without this the
+        // call silently kept the old mode and downstream samples/frame +
+        // bytes/frame readers returned the wrong values.
+        deinitEncoder();
+    }
     s_codec2 = codec2_create((int)mode);
     if (s_codec2 == nullptr) {
         LOG_ERROR("VtAudio: codec2_create(mode=%d) failed", (int)mode);
         return false;
     }
+    s_codec2_mode    = mode;
     s_codec2_samples = codec2_samples_per_frame(s_codec2);
     s_codec2_bytes   = (codec2_bits_per_frame(s_codec2) + 7) / 8;
     LOG_INFO("VtAudio: codec2 ready mode=%d samples/frame=%d bytes/frame=%d",
@@ -205,12 +215,19 @@ void VtAudio::encodeFrame(const int16_t *pcm, uint8_t *out_bytes)
 
 bool VtAudio::initDecoder(Codec2Mode mode)
 {
-    if (s_codec2_dec != nullptr) return true; // idempotent
+    if (s_codec2_dec != nullptr) {
+        if (s_codec2_dec_mode == mode) return true; // already at the requested mode
+        // Each inbound message carries its own codec_param on the wire, so the
+        // playback worker can hit decode mode A on one message and mode B on
+        // the next. Swap the decoder instance to match.
+        deinitDecoder();
+    }
     s_codec2_dec = codec2_create((int)mode);
     if (s_codec2_dec == nullptr) {
         LOG_ERROR("VtAudio: codec2_create(decoder, mode=%d) failed", (int)mode);
         return false;
     }
+    s_codec2_dec_mode    = mode;
     s_codec2_dec_samples = codec2_samples_per_frame(s_codec2_dec);
     s_codec2_dec_bytes   = (codec2_bits_per_frame(s_codec2_dec) + 7) / 8;
     LOG_INFO("VtAudio: codec2 decoder ready mode=%d samples/frame=%d bytes/frame=%d",

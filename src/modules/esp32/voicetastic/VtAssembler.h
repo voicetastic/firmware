@@ -69,7 +69,17 @@ class VtAssembler {
         uint8_t   total_data = 0;
         uint8_t   parity_count = 0;
         bool      give_up = false; // set if NACK_MAX_ROUNDS exhausted
-        std::vector<bool> missing; // length total_data; bit i ⇒ chunk i missing
+        // Data-only bitmap: bit i ⇒ DATA chunk i is missing. Length = total_data.
+        // We deliberately do NOT signal missing PARITY shards. With RS-over-GF(2^8)
+        // the assembler can finalize as soon as it holds `total_data` shards in
+        // any combination of DATA + PARITY, so the sender only needs to top us up
+        // to `total_data` shards. Retransmitting the missing DATA shards always
+        // satisfies that condition (and lands us in the FEC-free direct path); a
+        // parity-aware bitmap would let the sender substitute fresh parity for a
+        // lost data shard, but at no airtime saving vs. resending the data
+        // directly. Keeping the bitmap data-only also keeps the wire format
+        // bit-identical to voicetastic-desktop's NACK frame.
+        std::vector<bool> missing;
     };
 
     // Returns true and fills `out` if any in-progress assembly is ready to

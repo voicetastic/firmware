@@ -324,12 +324,21 @@ esp_err_t es7210_adc_init(TwoWire *tw,  audio_hal_codec_config_t *codec_cfg)
     ret |= es7210_config_sample(i2s_cfg->samples);
     ret |= es7210_mic_select(mic_select);
     ret |= es7210_adc_set_gain_all(GAIN_0DB);
-    return ESP_OK;
+    return ret;
 }
+
+// Forward declaration: defined later in this file, called from deinit.
+esp_err_t es7210_stop(void);
 
 esp_err_t es7210_adc_deinit()
 {
-    return ESP_OK;
+    // Gate the clocks and power down the mic front-end. Without this the
+    // codec keeps drawing current and holding I2S clocks after the driver
+    // teardown, which masks failures on the next initMic() (a stale
+    // half-configured chip looks "running" to anything that doesn't read
+    // back registers). Caller is expected to have stopped the I2S driver
+    // first so MCLK is no longer fed to the chip.
+    return es7210_stop();
 }
 
 esp_err_t es7210_config_fmt(audio_hal_iface_format_t fmt)

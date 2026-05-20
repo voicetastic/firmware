@@ -19,6 +19,7 @@
 // ≤ 15 chars and key ≤ 15 chars (ESP-IDF NVS limit).
 static constexpr const char *VT_NVS_NAMESPACE = "voicetastic";
 static constexpr const char *VT_NVS_KEY_C2MODE = "c2mode";
+static constexpr const char *VT_NVS_KEY_STREAMSEQ = "streamseq";
 
 VoicetasticModule *voicetasticModule;
 
@@ -76,12 +77,17 @@ VoicetasticModule::VoicetasticModule()
         if (prefs.begin(VT_NVS_NAMESPACE, /*readOnly=*/true)) {
             const uint8_t fallback = (uint8_t)codec2_mode;
             const uint8_t stored = prefs.getUChar(VT_NVS_KEY_C2MODE, fallback);
+            // Resume the stream_seq from where the previous boot left off so
+            // an in-flight message can't collide with a fresh post-reboot send
+            // that happens to draw the same message_id. uint8_t wrap is fine.
+            stream_seq_counter = prefs.getUChar(VT_NVS_KEY_STREAMSEQ, 0);
             prefs.end();
             // Clamp to the valid enum range (M_3200..M_1200 = 0..5).
             if (stored <= (uint8_t)voicetastic::Codec2Mode::M_1200) {
                 codec2_mode = (voicetastic::Codec2Mode)stored;
                 LOG_INFO("Voicetastic: codec2 mode restored from NVS = %u", (unsigned)stored);
             }
+            LOG_INFO("Voicetastic: stream_seq resumed from NVS = %u", (unsigned)stream_seq_counter);
         }
     }
     runProtocolSelfTest();
@@ -114,6 +120,16 @@ bool VoicetasticModule::enqueueOutbound(const uint8_t *audio, size_t audio_len,
     const auto preset = (meshtastic_Config_LoRaConfig_ModemPreset)config.lora.modem_preset;
     const uint32_t mid = esp_random() | 1u; // non-zero u32 per spec §6
     const uint8_t  seq = stream_seq_counter++;
+    // Persist the next-to-use stream_seq immediately so a power loss between
+    // this send and the next boot doesn't replay a number already on the
+    // wire. NVS write of one byte is cheap; voice messages are user-paced.
+    {
+        Preferences prefs;
+        if (prefs.begin(VT_NVS_NAMESPACE, /*readOnly=*/false)) {
+            prefs.putUChar(VT_NVS_KEY_STREAMSEQ, stream_seq_counter);
+            prefs.end();
+        }
+    }
 
     if (!buildOutbound(audio, audio_len, preset, codec, codec_param, mid, seq, tx_msg)) {
         LOG_ERROR("Voicetastic: buildOutbound failed (audio_len=%u preset=%d)",
@@ -184,6 +200,7 @@ bool VoicetasticModule::startRecording(uint32_t duration_ms, NodeNum to)
 
     rec_duration_ms = duration_ms;
     rec_started_ms  = millis();
+    rec_frame_count = 0;
     rec_state       = eRecRecording;
     LOG_INFO("Voicetastic: recording started (%u ms) to %s", (unsigned)duration_ms, VT_PCM_PATH);
     return true;
@@ -220,12 +237,26 @@ void VoicetasticModule::stopRecording()
     using namespace voicetastic;
     if (rec_state != eRecRecording) return;
 
-    // Close the write handle and transition into the encoding phase.
+    // Close the write handle and reopen the same file for read. The encoder
+    // task inherits this single handle for the whole encoding pass — no need
+    // to re-open just to fstat the size.
     if (rec_pcm_file) {
         rec_pcm_file.flush();
         rec_pcm_file.close();
     }
-    const size_t pcm_bytes = FSCom.exists(VT_PCM_PATH) ? (size_t)FSCom.open(VT_PCM_PATH, FILE_READ).size() : 0;
+    if (!FSCom.exists(VT_PCM_PATH)) {
+        LOG_WARN("Voicetastic: no PCM file at %s after capture", VT_PCM_PATH);
+        rec_state = eRecIdle;
+        return;
+    }
+    rec_pcm_file = FSCom.open(VT_PCM_PATH, FILE_READ);
+    if (!rec_pcm_file) {
+        LOG_ERROR("Voicetastic: FSCom open(%s) for read failed", VT_PCM_PATH);
+        FSCom.remove(VT_PCM_PATH);
+        rec_state = eRecIdle;
+        return;
+    }
+    const size_t pcm_bytes = (size_t)rec_pcm_file.size();
     enc_frames_total = (uint32_t)(pcm_bytes / VT_PCM_BYTES_PER_FRAME);
     enc_frames_done  = 0;
     LOG_INFO("Voicetastic: captured %u PCM bytes (%u frames); encoding to Codec2 mode ord=%u",
@@ -238,20 +269,15 @@ void VoicetasticModule::stopRecording()
 
     if (enc_frames_total == 0) {
         // Nothing captured (e.g. user stopped immediately). Bail back to idle.
-        if (FSCom.exists(VT_PCM_PATH)) FSCom.remove(VT_PCM_PATH);
+        rec_pcm_file.close();
+        FSCom.remove(VT_PCM_PATH);
         rec_state = eRecIdle;
         return;
     }
     if (!VtAudio::initEncoder(codec2_mode)) {
         LOG_ERROR("Voicetastic: codec2 init failed at encoding phase");
-        if (FSCom.exists(VT_PCM_PATH)) FSCom.remove(VT_PCM_PATH);
-        rec_state = eRecIdle;
-        return;
-    }
-    rec_pcm_file = FSCom.open(VT_PCM_PATH, FILE_READ);
-    if (!rec_pcm_file) {
-        LOG_ERROR("Voicetastic: FSCom reopen(%s) for read failed", VT_PCM_PATH);
-        VtAudio::deinitEncoder();
+        rec_pcm_file.close();
+        FSCom.remove(VT_PCM_PATH);
         rec_state = eRecIdle;
         return;
     }
@@ -551,8 +577,11 @@ void VoicetasticModule::encoderTaskBody()
 void VoicetasticModule::recordFrame()
 {
     using namespace voicetastic;
+    // PCM scratch is static to keep it off the loop task's stack; the heartbeat
+    // counter is a member so it resets per-recording (a true static would keep
+    // climbing across recordings and stretch the modulo-25 log cadence
+    // arbitrarily after the first session).
     static int16_t pcm[VT_PCM_SAMPLES_PER_FRAME];
-    static uint32_t rec_frame_count = 0;
     const size_t got = VtAudio::readPcm(pcm, VT_PCM_SAMPLES_PER_FRAME, 30);
     if ((int)got >= VT_PCM_SAMPLES_PER_FRAME && rec_pcm_file) {
         rec_pcm_file.write((const uint8_t *)pcm, VT_PCM_BYTES_PER_FRAME);

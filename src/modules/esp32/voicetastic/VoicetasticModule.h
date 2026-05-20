@@ -135,8 +135,10 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     uint16_t tx_next_chunk = 0;       // 0..(total_data + parity_count - 1)
     uint32_t tx_paced_until_ms = 0;
     NodeNum  tx_to = NODENUM_BROADCAST;
-    uint8_t  tx_channel = 0;          // Meshtastic channel index for the outbound message;
-                                      // also drives the channel PSK lookup that keys the header MAC.
+    uint8_t  tx_channel = 0;          // Meshtastic channel index for the outbound message.
+                                      // The v3 header MAC is plain SHA-256 over header[0..12]
+                                      // (unkeyed); per-channel confidentiality is delegated to
+                                      // Meshtastic's per-packet AES-CTR.
     // NACK loop state. After the linear walk completes we keep tx_msg state
     // alive for TX_NACK_LINGER_MS so we can answer inbound NACKs by replaying
     // the missing data chunks. Retransmit queue is drained ahead of the linear
@@ -175,6 +177,7 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     uint32_t              rec_started_ms = 0;
     uint32_t              rec_duration_ms = 0;
     File                  rec_pcm_file;        // open during eRecRecording (write) and eRecEncoding (read)
+    uint32_t              rec_frame_count = 0;  // PCM frames captured this recording (reset in startRecording)
     uint32_t              enc_frames_total = 0; // populated when entering eRecEncoding
     uint32_t              enc_frames_done = 0;
 
