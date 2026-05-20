@@ -9,8 +9,8 @@
 
 namespace voicetastic {
 
-// Wire-format constants from VOICE_PROTOCOL.md (v2).
-static constexpr uint8_t  PROTOCOL_VERSION = 0x02;
+// Wire-format constants from VOICE_PROTOCOL.md (v3).
+static constexpr uint8_t  PROTOCOL_VERSION = 0x03;
 static constexpr size_t   HEADER_SIZE      = 16;   // 12 logical bytes + 4-byte MAC trailer
 static constexpr size_t   MAX_PACKET_SIZE  = 231;  // Meshtastic LoRa MTU
 static constexpr size_t   MAX_BODY_SIZE    = MAX_PACKET_SIZE - HEADER_SIZE; // 215
@@ -18,13 +18,13 @@ static constexpr size_t   MAC_TAG_SIZE     = 4;
 static constexpr uint8_t  MAX_CHUNKS_PER_MESSAGE = 255;
 static constexpr uint8_t  MAX_PARITY_PER_MESSAGE = 128;
 
-// type_flags bit layout (spec Appendix B).
-static constexpr uint8_t  MASK_PACKET_TYPE   = 0xC0;  // bits 6-7
-static constexpr uint8_t  MASK_ENCRYPTED     = 0x20;  // bit 5
-static constexpr uint8_t  MASK_LAST_IN_STREAM = 0x10; // bit 4
-static constexpr uint8_t  MASK_MAC_KEYED     = 0x08;  // bit 3
-static constexpr uint8_t  MASK_RESERVED      = 0x07;  // bits 0-2 (must be zero)
-static constexpr uint8_t  PACKET_TYPE_SHIFT  = 6;
+// type_flags bit layout (spec Appendix B). In v3 bits 5 (was `encrypted`)
+// and 3 (was `mac_keyed`) are reserved alongside bits 0-2; senders MUST set
+// them to 0 and receivers MUST drop any frame that has any reserved bit set.
+static constexpr uint8_t  MASK_PACKET_TYPE    = 0xC0;  // bits 6-7
+static constexpr uint8_t  MASK_LAST_IN_STREAM = 0x10;  // bit 4
+static constexpr uint8_t  MASK_RESERVED       = 0x2F;  // bits 5,3,2,1,0 (must be zero)
+static constexpr uint8_t  PACKET_TYPE_SHIFT   = 6;
 
 enum class PacketType : uint8_t {
     DATA    = 0,
@@ -53,11 +53,9 @@ enum class Codec2Mode : uint8_t {
 };
 
 struct VtHeader {
-    uint8_t    version;        // 0x02
+    uint8_t    version;        // 0x03
     PacketType packet_type;
-    bool       encrypted;
     bool       last_in_stream;
-    bool       mac_keyed;      // set by encodeHeader based on mac_key arg; read by decodeHeader from the flags byte
     uint32_t   message_id;
     CodecId    codec;
     uint8_t    codec_param;    // codec-specific ordinal
@@ -67,40 +65,28 @@ struct VtHeader {
     uint8_t    parity_count;
 };
 
-// Encode the 16-byte header into `out`. Computes the trailing 4-byte MAC.
-//   mac_key == nullptr or mac_key_len == 0:
-//       SHA-256(header[0..12])[..4]; the mac_keyed flag bit is cleared.
-//   mac_key != nullptr and mac_key_len > 0:
-//       HMAC-SHA256(mac_key, header[0..12])[..4]; the mac_keyed flag bit is set.
-// `h.mac_keyed` is overwritten to match the actual computation, so callers
-// don't have to keep the two in sync.
-// Returns HEADER_SIZE on success or 0 if `h` violates a spec rejection rule
-// catchable pre-emission:
-//   - h.version != 0x02
+// Encode the 16-byte header into `out`. Computes the trailing 4-byte tag as
+// `SHA-256(header[0..12])[..4]`. Returns HEADER_SIZE on success or 0 if `h`
+// violates a spec rejection rule catchable pre-emission:
+//   - h.version != 0x03
 //   - h.packet_type == RESERVED
 //   - h.total_data == 0 (except for NACK frames, which still echo a value)
 //   - h.parity_count > MAX_PARITY_PER_MESSAGE
-size_t encodeHeader(VtHeader &h, uint8_t out[HEADER_SIZE],
-                    const uint8_t *mac_key = nullptr, size_t mac_key_len = 0);
+size_t encodeHeader(const VtHeader &h, uint8_t out[HEADER_SIZE]);
 
 // Decode a 16-byte header. Returns true iff:
-//   - in[0] == 0x02
-//   - MAC tag matches the appropriate computation:
-//       header advertises mac_keyed=1 and mac_key != nullptr → HMAC-SHA256 compare;
-//       header advertises mac_keyed=1 and mac_key == nullptr → reject (cannot verify);
-//       header advertises mac_keyed=0 → SHA-256 compare, mac_key ignored.
+//   - in[0] == 0x03
+//   - any reserved bit of type_flags (mask 0x2F) is clear
 //   - packet_type != RESERVED
+//   - SHA-256(in[0..12])[..4] matches the trailing tag
 //   - total_data != 0  (per spec §9.2 rejection rule)
 //   - parity_count <= MAX_PARITY_PER_MESSAGE
 // On false: `out` is left in an undefined state.
-bool decodeHeader(const uint8_t in[HEADER_SIZE], VtHeader &out,
-                  const uint8_t *mac_key = nullptr, size_t mac_key_len = 0);
+bool decodeHeader(const uint8_t in[HEADER_SIZE], VtHeader &out);
 
-// Compute the 4-byte MAC tag for a given 12-byte logical header. If
-// `mac_key != nullptr && mac_key_len > 0`, computes HMAC-SHA256; otherwise
-// plain SHA-256. Internal helper, exposed for test/debug use.
-void computeHeaderMac(const uint8_t header12[12], uint8_t out_tag[MAC_TAG_SIZE],
-                      const uint8_t *mac_key = nullptr, size_t mac_key_len = 0);
+// Compute the 4-byte unkeyed integrity tag for a given 12-byte logical
+// header. Internal helper, exposed for test/debug use.
+void computeHeaderMac(const uint8_t header12[12], uint8_t out_tag[MAC_TAG_SIZE]);
 
 // NACK body wire format (spec §3.4).
 //   byte 0:       nack_version = 0x01

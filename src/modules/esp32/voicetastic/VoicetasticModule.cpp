@@ -6,60 +6,6 @@
 #include "NodeDB.h"
 #include "RadioInterface.h"
 #include "Router.h"
-#include "mesh/Channels.h"
-
-namespace {
-
-// Resolve the AES-key bytes that Meshtastic would use to encrypt this channel.
-// Mirrors Channels::getKey() (which is private in upstream): handles short-form
-// PSK expansion (1-byte index → defaultpsk + bump), secondary-without-key
-// fallback to primary, and zero-padding of short user-provided keys. Returns
-// true and fills `out` with up to 32 bytes; `out_len = 0` means the channel is
-// in plaintext mode ("User disabled encryption"). On disabled / invalid
-// channels returns false.
-//
-// Used as the HMAC-SHA256 key for the v2 header MAC (spec §3 / §7) so we stay
-// bit-compatible with voicetastic-desktop, which keys the same way.
-bool resolveChannelPsk(uint8_t channel, uint8_t out[32], size_t &out_len)
-{
-    const meshtastic_Channel &ch = channels.getByIndex(channel);
-    if (!ch.has_settings || ch.role == meshtastic_Channel_Role_DISABLED) {
-        out_len = 0;
-        return false;
-    }
-    const auto &ps = ch.settings.psk;
-    memset(out, 0, 32);
-
-    if (ps.size == 0) {
-        if (ch.role == meshtastic_Channel_Role_SECONDARY) {
-            // Inherit primary channel's key.
-            return resolveChannelPsk((uint8_t)channels.getPrimaryIndex(), out, out_len);
-        }
-        out_len = 0; // encryption disabled
-        return true;
-    }
-    if (ps.size == 1) {
-        const uint8_t pskIndex = ps.bytes[0];
-        if (pskIndex == 0) {
-            out_len = 0; // encryption disabled via short index 0
-            return true;
-        }
-        memcpy(out, defaultpsk, sizeof(defaultpsk));
-        // Per Channels::getKey: short index 1 = unchanged defaultpsk; higher
-        // indices bump the last byte.
-        out[sizeof(defaultpsk) - 1] = (uint8_t)(out[sizeof(defaultpsk) - 1] + pskIndex - 1);
-        out_len = sizeof(defaultpsk);
-        return true;
-    }
-    const size_t n = ps.size <= 32 ? (size_t)ps.size : 32;
-    memcpy(out, ps.bytes, n);
-    if (n < 16)               out_len = 16;       // AES128 zero-pad
-    else if (n < 32 && n != 16) out_len = 32;    // AES256 zero-pad
-    else                        out_len = n;
-    return true;
-}
-
-} // namespace
 #include "VtAudio.h"
 #include "VtProtocol.h"
 #include "concurrency/LockGuard.h"
@@ -78,9 +24,7 @@ static void runProtocolSelfTest()
     VtHeader h{};
     h.version        = PROTOCOL_VERSION;
     h.packet_type    = PacketType::DATA;
-    h.encrypted      = false;
     h.last_in_stream = false;
-    h.mac_keyed      = false;
     h.message_id     = 0xDEADBEEF;
     h.codec          = CodecId::CODEC2;
     h.codec_param    = (uint8_t)Codec2Mode::M_1200; // self-test only; any valid mode is fine
@@ -102,7 +46,7 @@ static void runProtocolSelfTest()
     }
 
     const bool ok =
-        r.version == h.version && r.packet_type == h.packet_type && r.encrypted == h.encrypted &&
+        r.version == h.version && r.packet_type == h.packet_type &&
         r.last_in_stream == h.last_in_stream && r.message_id == h.message_id && r.codec == h.codec &&
         r.codec_param == h.codec_param && r.stream_seq == h.stream_seq && r.chunk_index == h.chunk_index &&
         r.total_data == h.total_data && r.parity_count == h.parity_count;
@@ -601,25 +545,13 @@ void VoicetasticModule::txSendShard(bool is_data, uint8_t idx, bool last_in_stre
 {
     using namespace voicetastic;
 
-    // Look up the channel PSK (expanded form) only to feed the keyed-MAC.
-    // Confidentiality is left to Meshtastic's per-packet AES-CTR layer — we
-    // no longer wrap the body in the AES-GCM envelope (spec §7), saving the
-    // 28 bytes/frame of nonce+tag and one HKDF derivation per frame. The
-    // receive path still accepts encrypted=1 frames from peers that emit
-    // them; we just never set the bit ourselves.
-    uint8_t psk_buf[32] = {0};
-    size_t  psk_len = 0;
-    resolveChannelPsk(tx_channel, psk_buf, psk_len);
-    const bool use_keyed_mac = mac_keyed_tx_enabled && psk_len > 0;
-    const uint8_t *mac_key  = use_keyed_mac ? psk_buf : nullptr;
-    const size_t   mac_klen = use_keyed_mac ? psk_len : 0;
+    // V3: header tag is always unkeyed SHA-256(header[0..12])[..4].
+    // Confidentiality is delegated to Meshtastic's per-packet AES-CTR.
 
     VtHeader h{};
     h.version        = PROTOCOL_VERSION;
     h.packet_type    = is_data ? PacketType::DATA : PacketType::PARITY;
-    h.encrypted      = false;
     h.last_in_stream = last_in_stream;
-    h.mac_keyed      = false; // overwritten by encodeHeader based on the key arg
     h.message_id     = tx_msg.message_id;
     h.codec          = tx_msg.codec;
     h.codec_param    = tx_msg.codec_param;
@@ -629,7 +561,7 @@ void VoicetasticModule::txSendShard(bool is_data, uint8_t idx, bool last_in_stre
     h.parity_count   = tx_msg.parity_count;
 
     uint8_t header_buf[HEADER_SIZE] = {0};
-    if (encodeHeader(h, header_buf, mac_key, mac_klen) != HEADER_SIZE) {
+    if (encodeHeader(h, header_buf) != HEADER_SIZE) {
         LOG_ERROR("Voicetastic: header encode failed (idx=%u)", (unsigned)idx);
         return;
     }
@@ -669,9 +601,7 @@ void VoicetasticModule::sendNack(const voicetastic::VtAssembler::PendingNack &nk
     VtHeader h{};
     h.version        = PROTOCOL_VERSION;
     h.packet_type    = PacketType::NACK;
-    h.encrypted      = false;     // spec §3.4: NACKs MUST NOT use the GCM envelope
     h.last_in_stream = false;
-    h.mac_keyed      = false;
     h.message_id     = nk.message_id;
     h.codec          = nk.codec;
     h.codec_param    = nk.codec_param;
@@ -680,15 +610,8 @@ void VoicetasticModule::sendNack(const voicetastic::VtAssembler::PendingNack &nk
     h.total_data     = nk.total_data;
     h.parity_count   = nk.parity_count;
 
-    uint8_t psk_buf[32] = {0};
-    size_t  psk_len = 0;
-    resolveChannelPsk(nk.channel, psk_buf, psk_len);
-    const bool use_keyed_mac = mac_keyed_tx_enabled && psk_len > 0;
-    const uint8_t *mac_key  = use_keyed_mac ? psk_buf : nullptr;
-    const size_t   mac_klen = use_keyed_mac ? psk_len : 0;
-
     uint8_t header_buf[HEADER_SIZE] = {0};
-    if (encodeHeader(h, header_buf, mac_key, mac_klen) != HEADER_SIZE) {
+    if (encodeHeader(h, header_buf) != HEADER_SIZE) {
         LOG_ERROR("Voicetastic: NACK header encode failed (mid=%08x)", (unsigned)nk.message_id);
         return;
     }
@@ -741,20 +664,11 @@ ProcessMessage VoicetasticModule::handleReceived(const meshtastic_MeshPacket &mp
         return ProcessMessage::CONTINUE;
     }
 
-    // Resolve the inbound channel's PSK so we can verify keyed MACs. Frames
-    // advertising mac_keyed=1 on a channel where we have no PSK will be rejected
-    // by decodeHeader (no way to validate authenticity).
-    uint8_t rx_psk[32] = {0};
-    size_t  rx_psk_len = 0;
-    resolveChannelPsk(mp.channel, rx_psk, rx_psk_len);
-    const uint8_t *rx_key  = (rx_psk_len > 0) ? rx_psk : nullptr;
-    const size_t   rx_klen = rx_psk_len;
-
     VtHeader h{};
-    if (!decodeHeader(p.payload.bytes, h, rx_key, rx_klen)) {
-        LOG_DEBUG("Voicetastic: header reject (ver=0x%02x size=%u ch=%u keyed=%u)",
+    if (!decodeHeader(p.payload.bytes, h)) {
+        LOG_DEBUG("Voicetastic: header reject (ver=0x%02x size=%u ch=%u)",
                   (unsigned)p.payload.bytes[0], (unsigned)p.payload.size,
-                  (unsigned)mp.channel, (unsigned)((p.payload.bytes[1] & MASK_MAC_KEYED) != 0));
+                  (unsigned)mp.channel);
         return ProcessMessage::CONTINUE;
     }
 
@@ -810,17 +724,6 @@ ProcessMessage VoicetasticModule::handleReceived(const meshtastic_MeshPacket &mp
         tx_linger_until_ms = millis() + TX_NACK_LINGER_MS;
         LOG_INFO("Voicetastic: NACK mid=%08x queued %u retransmits (queue=%u)",
                  (unsigned)h.message_id, added, (unsigned)tx_retransmit_idx.size());
-        return ProcessMessage::CONTINUE;
-    }
-
-    // Voicetastic confidentiality is delegated to Meshtastic's channel-level
-    // AES-CTR; we don't implement the spec §7 AES-GCM envelope. Frames that
-    // advertise encrypted=1 from peers that *do* implement it would decode
-    // as opaque ciphertext, so drop them rather than feed garbage to the
-    // assembler.
-    if (h.encrypted) {
-        LOG_DEBUG("Voicetastic: dropping encrypted=1 frame mid=%08x (envelope not supported)",
-                  (unsigned)h.message_id);
         return ProcessMessage::CONTINUE;
     }
 

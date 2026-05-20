@@ -85,16 +85,6 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     voicetastic::Codec2Mode getCodec2Mode() const { return codec2_mode; }
     void setCodec2Mode(voicetastic::Codec2Mode mode) { codec2_mode = mode; }
 
-    // HMAC-keyed header MAC (spec §3, mac_keyed=1) on outbound frames. When
-    // disabled (default), frames carry the unkeyed SHA-256 truncated tag,
-    // which every v2 receiver accepts unconditionally. Enable when the
-    // receiver is known to have the channel PSK loaded for verification —
-    // some receivers (voicetastic-desktop ≤ 0.x) reject mac_keyed=1 frames
-    // with MacKeyMissing if their assembler config wasn't fed the PSK.
-    // Receive-side verification of inbound mac_keyed=1 frames is always
-    // performed against the local channel PSK, regardless of this flag.
-    bool isMacKeyedEnabled() const { return mac_keyed_tx_enabled; }
-    void setMacKeyedEnabled(bool on) { mac_keyed_tx_enabled = on; }
 
     // Mini-player API. Received voice messages no longer auto-play; instead
     // they accumulate in pending_play_queue and the chat-screen widget drives
@@ -170,16 +160,6 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
 #define VOICETASTIC_CODEC2_MODE voicetastic::Codec2Mode::M_1200
 #endif
     voicetastic::Codec2Mode codec2_mode = VOICETASTIC_CODEC2_MODE;
-
-    // Keyed (HMAC-SHA256) header MAC opt-in (spec §3, mac_keyed=1). Default
-    // off because voicetastic-desktop receivers don't currently plumb the
-    // channel PSK into their assembler config and reject mac_keyed=1 frames
-    // with MacKeyMissing. Build flag override:
-    // -DVOICETASTIC_DEFAULT_MAC_KEYED=1.
-#ifndef VOICETASTIC_DEFAULT_MAC_KEYED
-#define VOICETASTIC_DEFAULT_MAC_KEYED 0
-#endif
-    bool mac_keyed_tx_enabled = (VOICETASTIC_DEFAULT_MAC_KEYED != 0);
 
     // SD-buffered recording state.
     //
