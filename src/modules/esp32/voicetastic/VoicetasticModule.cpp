@@ -813,52 +813,22 @@ ProcessMessage VoicetasticModule::handleReceived(const meshtastic_MeshPacket &mp
         return ProcessMessage::CONTINUE;
     }
 
-    // If the sender wrapped the body in an AES-GCM envelope (spec §7),
-    // decrypt it before handing off to the assembler. We keep the plaintext
-    // in a stack buffer sized for one frame body.
-    const uint8_t *body_ptr = p.payload.bytes + HEADER_SIZE;
-    size_t         body_use_len = body_len;
-    uint8_t        decrypted_buf[MAX_PLAINTEXT_BODY];
+    // Voicetastic confidentiality is delegated to Meshtastic's channel-level
+    // AES-CTR; we don't implement the spec §7 AES-GCM envelope. Frames that
+    // advertise encrypted=1 from peers that *do* implement it would decode
+    // as opaque ciphertext, so drop them rather than feed garbage to the
+    // assembler.
     if (h.encrypted) {
-        if (rx_psk_len == 0) {
-            LOG_DEBUG("Voicetastic: dropping encrypted frame mid=%08x on PSK-less channel",
-                      (unsigned)h.message_id);
-            return ProcessMessage::CONTINUE;
-        }
-        if (body_len < GCM_NONCE_LEN + GCM_TAG_LEN) {
-            LOG_WARN("Voicetastic: encrypted body too short (%u)", (unsigned)body_len);
-            return ProcessMessage::CONTINUE;
-        }
-        const size_t ct_len = body_len - GCM_NONCE_LEN - GCM_TAG_LEN;
-        if (ct_len > sizeof(decrypted_buf)) {
-            LOG_WARN("Voicetastic: encrypted ciphertext too large (%u)", (unsigned)ct_len);
-            return ProcessMessage::CONTINUE;
-        }
-        uint8_t key32[GCM_KEY_LEN];
-        if (!deriveEnvelopeKey(rx_psk, rx_psk_len, h.message_id, mp.from, key32)) {
-            LOG_WARN("Voicetastic: HKDF failed for mid=%08x", (unsigned)h.message_id);
-            return ProcessMessage::CONTINUE;
-        }
-        // AAD = header[0..12] per spec §7.
-        if (!gcmDecrypt(key32,
-                        /*nonce=*/ p.payload.bytes + HEADER_SIZE,
-                        /*aad=*/ p.payload.bytes, HEADER_SIZE - MAC_TAG_SIZE,
-                        /*ct=*/ p.payload.bytes + HEADER_SIZE + GCM_NONCE_LEN, ct_len,
-                        /*tag=*/ p.payload.bytes + HEADER_SIZE + GCM_NONCE_LEN + ct_len,
-                        decrypted_buf)) {
-            LOG_WARN("Voicetastic: GCM auth failed mid=%08x ci=%u",
-                     (unsigned)h.message_id, (unsigned)h.chunk_index);
-            return ProcessMessage::CONTINUE;
-        }
-        body_ptr = decrypted_buf;
-        body_use_len = ct_len;
+        LOG_DEBUG("Voicetastic: dropping encrypted=1 frame mid=%08x (envelope not supported)",
+                  (unsigned)h.message_id);
+        return ProcessMessage::CONTINUE;
     }
 
     // Hand DATA / PARITY frames to the per-(from, message_id) assembler. It
     // deals with shard storage, chunk_size inference (spec §4), FEC
     // reconstruction, and queuing complete messages for playback (Phase 6).
     if (assembler.acceptFrame(mp.from, mp.to, mp.channel, h,
-                              body_ptr, body_use_len)) {
+                              p.payload.bytes + HEADER_SIZE, body_len)) {
         // A new message was just completed. Phase 6 will drain the assembler's
         // complete-queue into the playback engine; for now we just leave it
         // sitting there so anyone polling popComplete() can pick it up.

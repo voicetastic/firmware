@@ -4,7 +4,6 @@
 
 #include "CryptoEngine.h"
 #include "configuration.h"
-#include "mbedtls/gcm.h"
 #include "mbedtls/md.h"
 #include <string.h>
 
@@ -143,86 +142,6 @@ bool decodeHeader(const uint8_t in[HEADER_SIZE], VtHeader &out,
     out.total_data     = total_data;
     out.parity_count   = parity_count;
     return true;
-}
-
-// HMAC-SHA256 over a single contiguous input. Local helper since ESP-IDF's
-// mbedtls is built without `mbedtls_hkdf` exposed; we synthesize HKDF below.
-static bool hmacSha256Single(const uint8_t *key, size_t key_len,
-                             const uint8_t *msg, size_t msg_len,
-                             uint8_t out[32])
-{
-    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (!info) return false;
-    return mbedtls_md_hmac(info, key, key_len, msg, msg_len, out) == 0;
-}
-
-bool deriveEnvelopeKey(const uint8_t *psk, size_t psk_len,
-                       uint32_t message_id, uint32_t from_node_num,
-                       uint8_t out_key[GCM_KEY_LEN])
-{
-    if (psk == nullptr || psk_len == 0) return false;
-
-    uint8_t ikm[8];
-    put_be32(ikm + 0, message_id);
-    put_be32(ikm + 4, from_node_num);
-
-    // HKDF-SHA256 (RFC 5869). L = 32 ≤ HashLen, so the expand step needs a
-    // single block:
-    //   PRK = HMAC-SHA256(salt = psk, ikm)
-    //   T(1) = HMAC-SHA256(PRK, info ‖ 0x01)
-    //   OKM = T(1)[..32]
-    // Spec §7: the HKDF `info` string is permanent across protocol revisions
-    // ("voicetastic/v2"), not bumped with the wire version byte.
-    static const uint8_t kInfo[] = "voicetastic/v2";
-    constexpr size_t kInfoLen = sizeof(kInfo) - 1;
-
-    uint8_t prk[32];
-    if (!hmacSha256Single(psk, psk_len, ikm, sizeof(ikm), prk)) return false;
-
-    uint8_t expand_in[kInfoLen + 1];
-    memcpy(expand_in, kInfo, kInfoLen);
-    expand_in[kInfoLen] = 0x01;
-    if (!hmacSha256Single(prk, sizeof(prk), expand_in, sizeof(expand_in), out_key)) return false;
-    return true;
-}
-
-bool gcmEncrypt(const uint8_t key[GCM_KEY_LEN], const uint8_t nonce[GCM_NONCE_LEN],
-                const uint8_t *aad, size_t aad_len,
-                const uint8_t *plain, size_t plain_len,
-                uint8_t *ct_out, uint8_t tag_out[GCM_TAG_LEN])
-{
-    mbedtls_gcm_context ctx;
-    mbedtls_gcm_init(&ctx);
-    bool ok = false;
-    if (mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, (unsigned)(GCM_KEY_LEN * 8)) == 0) {
-        ok = mbedtls_gcm_crypt_and_tag(&ctx, MBEDTLS_GCM_ENCRYPT, plain_len,
-                                       nonce, GCM_NONCE_LEN,
-                                       aad, aad_len,
-                                       plain, ct_out,
-                                       GCM_TAG_LEN, tag_out) == 0;
-    }
-    mbedtls_gcm_free(&ctx);
-    return ok;
-}
-
-bool gcmDecrypt(const uint8_t key[GCM_KEY_LEN], const uint8_t nonce[GCM_NONCE_LEN],
-                const uint8_t *aad, size_t aad_len,
-                const uint8_t *ct, size_t ct_len,
-                const uint8_t tag[GCM_TAG_LEN],
-                uint8_t *pt_out)
-{
-    mbedtls_gcm_context ctx;
-    mbedtls_gcm_init(&ctx);
-    bool ok = false;
-    if (mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, (unsigned)(GCM_KEY_LEN * 8)) == 0) {
-        ok = mbedtls_gcm_auth_decrypt(&ctx, ct_len,
-                                      nonce, GCM_NONCE_LEN,
-                                      aad, aad_len,
-                                      tag, GCM_TAG_LEN,
-                                      ct, pt_out) == 0;
-    }
-    mbedtls_gcm_free(&ctx);
-    return ok;
 }
 
 size_t encodeNackBody(uint8_t total_data, const bool *missing, bool give_up,
