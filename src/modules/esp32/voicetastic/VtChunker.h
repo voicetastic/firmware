@@ -49,8 +49,6 @@ struct OutboundMessage {
 //   preset:       used to pick chunk_size and default parity_count.
 //   codec, codec_param: copied into the result.
 //   message_id, stream_seq: caller-chosen identifiers.
-//   envelope:     if true, chunk_size is clamped to MAX_PLAINTEXT_BODY so the
-//                 sender's AES-GCM envelope (nonce 12 + tag 16) still fits.
 //
 // Returns true on success. Computes parity shards via rs::encode(). The
 // final data shard is internally zero-padded to chunk_size (needed for FEC);
@@ -59,8 +57,7 @@ bool buildOutbound(const uint8_t *audio, size_t audio_len,
                    meshtastic_Config_LoRaConfig_ModemPreset preset,
                    CodecId codec, uint8_t codec_param,
                    uint32_t message_id, uint8_t stream_seq,
-                   OutboundMessage &out,
-                   bool envelope = false);
+                   OutboundMessage &out);
 
 } // namespace voicetastic
 

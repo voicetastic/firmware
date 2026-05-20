@@ -66,17 +66,12 @@ bool buildOutbound(const uint8_t *audio, size_t audio_len,
                    meshtastic_Config_LoRaConfig_ModemPreset preset,
                    CodecId codec, uint8_t codec_param,
                    uint32_t message_id, uint8_t stream_seq,
-                   OutboundMessage &out,
-                   bool envelope)
+                   OutboundMessage &out)
 {
     if (audio == nullptr || audio_len == 0) return false;
 
-    uint8_t chunk_size = chunkSizeForPreset(preset);
+    const uint8_t chunk_size = chunkSizeForPreset(preset);
     if (chunk_size == 0) return false;
-    // Spec §4 / §7: with the AES-GCM envelope on, the wire body becomes
-    // nonce(12) + ciphertext(chunk_size) + tag(16); clamp so the resulting
-    // frame still fits inside MAX_BODY_SIZE.
-    if (envelope && chunk_size > MAX_PLAINTEXT_BODY) chunk_size = (uint8_t)MAX_PLAINTEXT_BODY;
     if (audio_len > maxAudioBytes(chunk_size)) return false;
 
     const size_t total_data_sz = (audio_len + chunk_size - 1) / chunk_size;

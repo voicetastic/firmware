@@ -85,14 +85,6 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     voicetastic::Codec2Mode getCodec2Mode() const { return codec2_mode; }
     void setCodec2Mode(voicetastic::Codec2Mode mode) { codec2_mode = mode; }
 
-    // AES-256-GCM envelope (spec §7) on outbound frames. When enabled AND the
-    // outbound channel has a PSK, each DATA / PARITY body is wrapped as
-    // `nonce(12) ‖ ciphertext ‖ tag(16)` with a per-message HKDF-derived key.
-    // Receive-side decryption is always attempted on frames whose `encrypted`
-    // bit is set, regardless of this flag. NACK frames are never encrypted.
-    bool isEnvelopeEnabled() const { return envelope_enabled; }
-    void setEnvelopeEnabled(bool on) { envelope_enabled = on; }
-
     // HMAC-keyed header MAC (spec §3, mac_keyed=1) on outbound frames. When
     // disabled (default), frames carry the unkeyed SHA-256 truncated tag,
     // which every v2 receiver accepts unconditionally. Enable when the
@@ -178,14 +170,6 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
 #define VOICETASTIC_CODEC2_MODE voicetastic::Codec2Mode::M_1200
 #endif
     voicetastic::Codec2Mode codec2_mode = VOICETASTIC_CODEC2_MODE;
-
-    // AES-256-GCM envelope opt-in (spec §7). Default off so the firmware keeps
-    // interoperating with v2 senders that don't encrypt. Build flag override:
-    // -DVOICETASTIC_DEFAULT_GCM_ENVELOPE=1 flips the default on.
-#ifndef VOICETASTIC_DEFAULT_GCM_ENVELOPE
-#define VOICETASTIC_DEFAULT_GCM_ENVELOPE 0
-#endif
-    bool envelope_enabled = (VOICETASTIC_DEFAULT_GCM_ENVELOPE != 0);
 
     // Keyed (HMAC-SHA256) header MAC opt-in (spec §3, mac_keyed=1). Default
     // off because voicetastic-desktop receivers don't currently plumb the
