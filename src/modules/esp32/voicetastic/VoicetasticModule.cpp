@@ -604,14 +604,16 @@ void VoicetasticModule::txSendShard(bool is_data, uint8_t idx, bool last_in_stre
 
     // Look up the channel PSK (expanded form). Used for two distinct purposes:
     // (a) keyed header MAC (spec §3), and (b) HKDF salt for the AES-GCM envelope
-    // (spec §7). The envelope is only emitted when both the runtime flag is
-    // set AND the channel has a real PSK.
+    // (spec §7). Both are gated by their own runtime flag: emitting mac_keyed=1
+    // when a peer's assembler doesn't carry the PSK trips MacKeyMissing on
+    // receive (observed against voicetastic-desktop), so we default off.
     uint8_t psk_buf[32] = {0};
     size_t  psk_len = 0;
     resolveChannelPsk(tx_channel, psk_buf, psk_len);
-    const uint8_t *mac_key  = (psk_len > 0) ? psk_buf : nullptr;
-    const size_t   mac_klen = psk_len;
     const bool use_envelope = envelope_enabled && psk_len > 0;
+    const bool use_keyed_mac = mac_keyed_tx_enabled && psk_len > 0;
+    const uint8_t *mac_key  = use_keyed_mac ? psk_buf : nullptr;
+    const size_t   mac_klen = use_keyed_mac ? psk_len : 0;
 
     VtHeader h{};
     h.version        = PROTOCOL_VERSION;
@@ -731,8 +733,9 @@ void VoicetasticModule::sendNack(const voicetastic::VtAssembler::PendingNack &nk
     uint8_t psk_buf[32] = {0};
     size_t  psk_len = 0;
     resolveChannelPsk(nk.channel, psk_buf, psk_len);
-    const uint8_t *mac_key  = (psk_len > 0) ? psk_buf : nullptr;
-    const size_t   mac_klen = psk_len;
+    const bool use_keyed_mac = mac_keyed_tx_enabled && psk_len > 0;
+    const uint8_t *mac_key  = use_keyed_mac ? psk_buf : nullptr;
+    const size_t   mac_klen = use_keyed_mac ? psk_len : 0;
 
     uint8_t header_buf[HEADER_SIZE] = {0};
     if (encodeHeader(h, header_buf, mac_key, mac_klen) != HEADER_SIZE) {
