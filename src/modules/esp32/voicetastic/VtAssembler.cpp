@@ -55,6 +55,8 @@ void VtAssembler::resetSlot(AssemblyState &s)
     s.parity_shards.clear();
     s.data_received.clear();
     s.parity_received.clear();
+    s.last_data_pending.clear();
+    s.last_data_pending.shrink_to_fit();
 }
 
 size_t VtAssembler::inProgressCount() const
@@ -176,13 +178,42 @@ bool VtAssembler::acceptFrame(NodeNum from, NodeNum to, uint8_t channel,
             for (auto &v : s->parity_shards) v.assign(s->chunk_size, 0);
             LOG_DEBUG("vtAssembler: mid=%08x chunk_size inferred = %u",
                       (unsigned)h.message_id, (unsigned)s->chunk_size);
+            // If a lone final-DATA arrived before chunk_size was known, its
+            // body was stashed in last_data_pending. Fold it into the final
+            // data shard now (spec §4). Drop the stash if it doesn't fit the
+            // newly-inferred chunk size — that means the sender used a
+            // chunk_size smaller than the lone-final body, which is illegal
+            // and the chunk would have failed the same-size check below.
+            if (s->last_data_seen && !s->last_data_pending.empty() &&
+                s->last_data_pending.size() <= (size_t)s->chunk_size) {
+                const uint8_t fi = (uint8_t)(s->total_data - 1);
+                std::vector<uint8_t> &dst = s->data_shards[fi];
+                dst.assign(s->chunk_size, 0);
+                memcpy(dst.data(), s->last_data_pending.data(), s->last_data_pending.size());
+                if (!s->data_received[fi]) {
+                    s->data_received[fi] = true;
+                    s->received_data_count++;
+                }
+                s->last_data_pending.clear();
+                s->last_data_pending.shrink_to_fit();
+            } else if (!s->last_data_pending.empty()) {
+                // Stash was for a bogus chunk_size — discard it.
+                LOG_WARN("vtAssembler: mid=%08x dropping stashed final-DATA (%u > chunk_size %u)",
+                         (unsigned)h.message_id,
+                         (unsigned)s->last_data_pending.size(),
+                         (unsigned)s->chunk_size);
+                s->last_data_pending.clear();
+                s->last_data_pending.shrink_to_fit();
+            }
         } else {
             // Lone final-DATA frame arrived first; defer chunk_size discovery
-            // (spec §4). Keep the frame around in a sidecar.
+            // (spec §4). Stash the body verbatim in the sidecar so we can fold
+            // it into data_shards once chunk_size becomes known. A retransmit
+            // of the same final-DATA simply overwrites the stash (same bytes).
+            if (body_len > MAX_BODY_SIZE) return false;
             s->last_data_real_size = body_len;
             s->last_data_seen = true;
-            // We can't size the shard yet — record will be filled in later when
-            // chunk_size becomes known.
+            s->last_data_pending.assign(body, body + body_len);
             return false;
         }
     }
@@ -236,11 +267,16 @@ bool VtAssembler::tryFinalize(AssemblyState &s)
     for (bool p : s.parity_received) if (p) present_total++;
     if (present_total < s.total_data) return false; // not enough yet
 
-    // Build the rs:: shard arrays. std::vector<bool> is a bit-packed
-    // specialisation (no .data()), so use a plain bool[] here.
-    const int total_shards = s.total_data + s.parity_count;
-    std::vector<uint8_t *> ptrs((size_t)total_shards);
-    bool *present_buf = new bool[total_shards];
+    // Build the rs:: shard arrays. Both arrays are bounded by the protocol
+    // caps (255 data + 128 parity = 383 entries), so they live on the stack —
+    // keeps this RX hot path off the heap and removes a silent OOM crash mode
+    // versus the previous `new bool[total_shards]` (no null-check).
+    // std::vector<bool> is a bit-packed specialisation (no .data()), so we use
+    // a plain bool[] for `present_buf`.
+    static constexpr int kMaxShards =
+        (int)MAX_CHUNKS_PER_MESSAGE + (int)MAX_PARITY_PER_MESSAGE; // 255 + 128
+    uint8_t *ptrs[kMaxShards];
+    bool     present_buf[kMaxShards];
     for (int i = 0; i < (int)s.total_data; i++) {
         if (!s.data_received[i]) {
             // Placeholder; rs::decode will overwrite missing data shards.
@@ -255,8 +291,7 @@ bool VtAssembler::tryFinalize(AssemblyState &s)
     }
 
     const bool decoded = rs::decode((int)s.total_data, (int)s.parity_count,
-                                    (size_t)s.chunk_size, ptrs.data(), present_buf);
-    delete[] present_buf;
+                                    (size_t)s.chunk_size, ptrs, present_buf);
     if (!decoded) return false; // not actually enough shards in usable combination
 
     // Mark all data shards as present after successful FEC.
@@ -343,6 +378,12 @@ bool VtAssembler::pollPendingNack(PendingNack &out, uint32_t now_ms)
 {
     for (auto &s : states_) {
         if (!s.in_use) continue;
+        // Spec §3.4 / Reliability-FEC-and-NACK.md: receivers MUST NOT emit
+        // NACKs for broadcast messages — every listener would NACK the same
+        // chunks and flood the sender, which has no way to pick a retransmit
+        // target anyway. Broadcasts rely on FEC + partial-on-timeout; the
+        // assembly's `tick()` still drives the absolute timeout.
+        if (s.to == NODENUM_BROADCAST) continue;
         // Need to know total_data and have at least one missing chunk to NACK.
         if (s.received_data_count == s.total_data) continue;
         if ((now_ms - s.last_chunk_ms) < NACK_QUIET_MS) continue;

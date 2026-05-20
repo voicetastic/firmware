@@ -8,6 +8,8 @@
 #include "SinglePortModule.h"
 #include "VtAssembler.h"
 #include "VtChunker.h"
+#include "concurrency/Lock.h"
+#include "concurrency/LockGuard.h"
 #include "concurrency/OSThread.h"
 #include "mesh/MeshTypes.h"
 #include "mesh/generated/meshtastic/portnums.pb.h"
@@ -54,7 +56,7 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
                          voicetastic::CodecId codec, uint8_t codec_param,
                          NodeNum to = NODENUM_BROADCAST, uint8_t channel = 0);
 
-    bool isTransmitting() const { return tx_active; }
+    bool isTransmitting() const { concurrency::LockGuard g(&state_lock_); return tx_active; }
 
     // Start a mic recording of up to `duration_ms` milliseconds at Codec2 mode
     // 1200 (8 kHz, ~150 B/s). Capture + encode happen one frame per runOnce()
@@ -70,7 +72,7 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
 
     // True while we're actively capturing PCM OR encoding the captured PCM
     // to Codec2 frames. The chat screen treats both as "REC..." for the user.
-    bool isRecording() const { return rec_state != eRecIdle; }
+    bool isRecording() const { concurrency::LockGuard g(&state_lock_); return rec_state != eRecIdle; }
 
     // Codec2 bitrate selection. Per VOICE_PROTOCOL.md §3.2.2, all modes share
     // the same wire framing — the mode is advertised in each frame's
@@ -82,7 +84,7 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     // M_3200 produces noticeably better audio at the cost of ~5x airtime.
     // M_1600 / M_1400 / M_1300 are interpolations. Use of M_700/M_700B would
     // require updating MAX_PARITY / chunk_size guards, not exposed here.
-    voicetastic::Codec2Mode getCodec2Mode() const { return codec2_mode; }
+    voicetastic::Codec2Mode getCodec2Mode() const { concurrency::LockGuard g(&state_lock_); return codec2_mode; }
     // Set and persist the encode mode in NVS so it survives reboot. The next
     // outbound recording uses the new mode; in-flight TX is unaffected.
     void setCodec2Mode(voicetastic::Codec2Mode mode);
@@ -91,15 +93,15 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     // Mini-player API. Received voice messages no longer auto-play; instead
     // they accumulate in pending_play_queue and the chat-screen widget drives
     // playback explicitly via these calls.
-    size_t   pendingPlayCount() const { return pending_play_queue.size(); }
+    size_t   pendingPlayCount() const { concurrency::LockGuard g(&state_lock_); return pending_play_queue.size(); }
     bool     playNextPending();              // start playing the oldest queued message
     bool     playByMessageId(uint32_t message_id); // play the queued message that matches; false if not found
     void     stopPlayback();                 // interrupt current playback (worker exits early)
-    bool     isPlaying() const { return playing; }
+    bool     isPlaying() const { concurrency::LockGuard g(&state_lock_); return playing; }
     uint32_t playbackElapsedMs() const;      // 0 when not playing
-    uint32_t playbackTotalMs() const { return play_total_ms; }
-    NodeNum  playbackFromNode() const { return play_from_node; }
-    uint32_t playbackMessageId() const { return play_message_id; }
+    uint32_t playbackTotalMs() const { concurrency::LockGuard g(&state_lock_); return play_total_ms; }
+    NodeNum  playbackFromNode() const { concurrency::LockGuard g(&state_lock_); return play_from_node; }
+    uint32_t playbackMessageId() const { concurrency::LockGuard g(&state_lock_); return play_message_id; }
     // Inspect a queued message without consuming it.
     bool     peekPending(size_t index, NodeNum &from, uint32_t &message_id,
                          uint32_t &approx_duration_ms) const;
@@ -112,7 +114,7 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
                              bool &played) const;
 
     // True when there's a captured-but-unsent audio buffer waiting to be sent.
-    bool hasPending() const { return !pending_audio.empty(); }
+    bool hasPending() const { concurrency::LockGuard g(&state_lock_); return !pending_audio.empty(); }
 
     // Send the held audio to the chosen destination. Returns false if there's
     // no held audio or TX is already in progress.
@@ -129,6 +131,31 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     virtual int32_t runOnce() override;
 
   private:
+    // Coarse-grained mutex around module state. Acquired at every public entry
+    // point and at the top of runOnce()/handleReceived(). The UI/TFT task lives
+    // on core 0 and calls into the IClientBase voice* hooks (via
+    // VoicetasticPacketClient); runOnce() and handleReceived() are scheduled by
+    // the OSThread controller on the main task. Both threads read+write the
+    // play queue, the TX state machine and the recording state, so a lock is
+    // mandatory — without one, an LVGL peek racing a push_back would corrupt
+    // the vector.
+    //
+    // Worker tasks (encoder, playback) do NOT take this lock. They hand off via
+    // `volatile bool` flags and own dedicated result buffers; the loop task
+    // only reads those buffers after the done flag flips. Internal helpers
+    // invoked from inside the lock (recordFrame, sendOneChunk, txSendShard,
+    // sendNack, the *Locked variants) must NOT re-acquire — concurrency::Lock
+    // is not recursive.
+    mutable concurrency::Lock state_lock_;
+
+    // Lock-assuming variants of public methods that are also called from
+    // already-locked internal contexts (sendPending → enqueueOutboundLocked,
+    // recordFrame → stopRecordingLocked).
+    bool enqueueOutboundLocked(const uint8_t *audio, size_t audio_len,
+                               voicetastic::CodecId codec, uint8_t codec_param,
+                               NodeNum to, uint8_t channel);
+    void stopRecordingLocked();
+
     // TX state. One in-flight message at a time in this iteration.
     voicetastic::OutboundMessage tx_msg{};
     bool     tx_active = false;

@@ -97,6 +97,7 @@ VoicetasticModule::VoicetasticModule()
 
 void VoicetasticModule::setCodec2Mode(voicetastic::Codec2Mode mode)
 {
+    concurrency::LockGuard g(&state_lock_);
     codec2_mode = mode;
     Preferences prefs;
     if (prefs.begin(VT_NVS_NAMESPACE, /*readOnly=*/false)) {
@@ -111,6 +112,14 @@ void VoicetasticModule::setCodec2Mode(voicetastic::Codec2Mode mode)
 bool VoicetasticModule::enqueueOutbound(const uint8_t *audio, size_t audio_len,
                                         voicetastic::CodecId codec, uint8_t codec_param,
                                         NodeNum to, uint8_t channel)
+{
+    concurrency::LockGuard g(&state_lock_);
+    return enqueueOutboundLocked(audio, audio_len, codec, codec_param, to, channel);
+}
+
+bool VoicetasticModule::enqueueOutboundLocked(const uint8_t *audio, size_t audio_len,
+                                              voicetastic::CodecId codec, uint8_t codec_param,
+                                              NodeNum to, uint8_t channel)
 {
     using namespace voicetastic;
     if (tx_active) {
@@ -158,6 +167,32 @@ static constexpr int VT_PCM_SAMPLES_PER_FRAME = 320;
 static constexpr size_t VT_PCM_BYTES_PER_FRAME = VT_PCM_SAMPLES_PER_FRAME * sizeof(int16_t);
 static constexpr const char *VT_PCM_PATH = "/voicetastic.pcm";
 
+// Forward-declare the codec2 frame-info helper used by the duration cap below.
+// (Definition appears later in this file alongside vtEstimateDurationMs.)
+static void vtCodec2FrameInfo(voicetastic::Codec2Mode mode, int &bytes_per_frame,
+                              int &samples_per_frame);
+
+// Maximum recording duration (ms) given the active modem preset and codec2
+// mode. Derived from the protocol cap `maxAudioBytes(chunk_size) = chunk_size *
+// 255` (spec §4) divided by the codec's byte rate. Mirroring the post-encode
+// check inside buildOutbound here lets startRecording fast-fail instead of
+// burning seconds capturing PCM and then rejecting at send time.
+static uint32_t vtMaxRecordingMs(meshtastic_Config_LoRaConfig_ModemPreset preset,
+                                 voicetastic::Codec2Mode mode)
+{
+    using namespace voicetastic;
+    const size_t max_bytes = maxAudioBytes(chunkSizeForPreset(preset));
+    int bpf = 6, spf = 320;
+    vtCodec2FrameInfo(mode, bpf, spf);
+    if (bpf <= 0 || spf <= 0) return 0;
+    // bytes_per_sec = bpf * 8000 / spf. Convert max_bytes -> milliseconds:
+    //   ms = max_bytes * 1000 / bytes_per_sec
+    //      = max_bytes * spf / (bpf * 8)
+    const uint64_t ms = (uint64_t)max_bytes * (uint64_t)spf / ((uint64_t)bpf * 8u);
+    if (ms > 0xFFFFFFFFu) return 0xFFFFFFFFu;
+    return (uint32_t)ms;
+}
+
 // We buffer PCM in LittleFS (the firmware's internal filesystem, mounted at
 // boot via FSCom). Guard returns true as long as FSCom has at least *some*
 // addressable space — i.e. the FS is mounted. If LittleFS failed to mount
@@ -169,10 +204,25 @@ static bool vtStorageAvailable()
 
 bool VoicetasticModule::startRecording(uint32_t duration_ms, NodeNum to)
 {
+    concurrency::LockGuard g(&state_lock_);
     using namespace voicetastic;
     (void)to; // Destination is decided at sendPending() time.
     if (rec_state != eRecIdle) { LOG_WARN("Voicetastic: already recording/encoding"); return false; }
     if (tx_active) { LOG_WARN("Voicetastic: TX in progress; cannot record yet"); return false; }
+    if (duration_ms == 0) { LOG_WARN("Voicetastic: zero-duration recording rejected"); return false; }
+
+    // Reject up front anything that wouldn't survive the post-encode check in
+    // buildOutbound. The max is preset+mode dependent; computing it here keeps
+    // the UI honest without spending seconds capturing PCM that buildOutbound
+    // would then refuse. The post-encode check still acts as a backstop in
+    // case the modem preset or codec mode changes mid-recording.
+    const auto preset = (meshtastic_Config_LoRaConfig_ModemPreset)config.lora.modem_preset;
+    const uint32_t max_ms = vtMaxRecordingMs(preset, codec2_mode);
+    if (max_ms > 0 && duration_ms > max_ms) {
+        LOG_WARN("Voicetastic: requested duration %u ms exceeds max %u ms for preset=%d codec2=%u",
+                 (unsigned)duration_ms, (unsigned)max_ms, (int)preset, (unsigned)codec2_mode);
+        return false;
+    }
 
     // Guard: voice recording needs an SD card mounted (we buffer raw PCM there
     // to keep codec2_encode out of the loop task during capture). Without one,
@@ -208,12 +258,14 @@ bool VoicetasticModule::startRecording(uint32_t duration_ms, NodeNum to)
 
 uint32_t VoicetasticModule::recordElapsedMs() const
 {
+    concurrency::LockGuard g(&state_lock_);
     if (rec_state != eRecRecording) return 0;
     return millis() - rec_started_ms;
 }
 
 bool VoicetasticModule::sendPending(NodeNum to, uint8_t channel)
 {
+    concurrency::LockGuard g(&state_lock_);
     using namespace voicetastic;
     if (pending_audio.empty()) return false;
     if (tx_active) { LOG_WARN("Voicetastic: TX busy; cannot send pending audio yet"); return false; }
@@ -222,17 +274,24 @@ bool VoicetasticModule::sendPending(NodeNum to, uint8_t channel)
     pending_audio.clear();
     pending_audio.shrink_to_fit();
     if (audio.empty()) return false;
-    return enqueueOutbound(audio.data(), audio.size(),
-                           CodecId::CODEC2, (uint8_t)codec2_mode, to, channel);
+    return enqueueOutboundLocked(audio.data(), audio.size(),
+                                 CodecId::CODEC2, (uint8_t)codec2_mode, to, channel);
 }
 
 void VoicetasticModule::discardPending()
 {
+    concurrency::LockGuard g(&state_lock_);
     pending_audio.clear();
     pending_audio.shrink_to_fit();
 }
 
 void VoicetasticModule::stopRecording()
+{
+    concurrency::LockGuard g(&state_lock_);
+    stopRecordingLocked();
+}
+
+void VoicetasticModule::stopRecordingLocked()
 {
     using namespace voicetastic;
     if (rec_state != eRecRecording) return;
@@ -341,6 +400,8 @@ static uint32_t vtEstimateDurationMs(const voicetastic::ReceivedVoiceMessage &ms
 
 bool VoicetasticModule::startPlayback(const voicetastic::ReceivedVoiceMessage &msg)
 {
+    // Internal helper; callers (playNextPending, playByMessageId) already hold
+    // state_lock_. The Lock is non-recursive, so no LockGuard here.
     using namespace voicetastic;
     if (playing) return false;
     if (rec_state != eRecIdle) return false;     // can't play while recording/encoding
@@ -375,6 +436,7 @@ bool VoicetasticModule::startPlayback(const voicetastic::ReceivedVoiceMessage &m
 
 bool VoicetasticModule::playNextPending()
 {
+    concurrency::LockGuard g(&state_lock_);
     if (pending_play_queue.empty()) return false;
     if (playing) return false;
     if (rec_state != eRecIdle) return false;
@@ -395,6 +457,7 @@ bool VoicetasticModule::playNextPending()
 
 bool VoicetasticModule::playByMessageId(uint32_t message_id)
 {
+    concurrency::LockGuard g(&state_lock_);
     if (playing) return false;
     if (rec_state != eRecIdle) return false;
     if (tx_active) return false;
@@ -410,12 +473,14 @@ bool VoicetasticModule::playByMessageId(uint32_t message_id)
 
 void VoicetasticModule::stopPlayback()
 {
+    concurrency::LockGuard g(&state_lock_);
     if (!playing) return;
     playback_stop_requested = true;
 }
 
 uint32_t VoicetasticModule::playbackElapsedMs() const
 {
+    concurrency::LockGuard g(&state_lock_);
     if (!playing || play_started_ms == 0) return 0;
     return millis() - play_started_ms;
 }
@@ -423,6 +488,7 @@ uint32_t VoicetasticModule::playbackElapsedMs() const
 bool VoicetasticModule::peekPending(size_t index, NodeNum &from, uint32_t &message_id,
                                     uint32_t &approx_duration_ms) const
 {
+    concurrency::LockGuard g(&state_lock_);
     if (index >= pending_play_queue.size()) return false;
     const auto &m = pending_play_queue[index];
     from = m.from;
@@ -435,6 +501,7 @@ bool VoicetasticModule::peekPendingFull(size_t index, NodeNum &from, NodeNum &to
                                         uint8_t &channel, uint32_t &message_id,
                                         uint32_t &approx_duration_ms, bool &played) const
 {
+    concurrency::LockGuard g(&state_lock_);
     if (index >= pending_play_queue.size()) return false;
     const auto &m = pending_play_queue[index];
     from = m.from;
@@ -600,7 +667,9 @@ void VoicetasticModule::recordFrame()
         }
     }
     if ((millis() - rec_started_ms) >= rec_duration_ms) {
-        stopRecording();
+        // recordFrame() is invoked from runOnce() which already holds state_lock_.
+        // The Lock is non-recursive, so we must use the *Locked variant here.
+        stopRecordingLocked();
     }
 }
 
@@ -739,6 +808,7 @@ void VoicetasticModule::sendNack(const voicetastic::VtAssembler::PendingNack &nk
 
 ProcessMessage VoicetasticModule::handleReceived(const meshtastic_MeshPacket &mp)
 {
+    concurrency::LockGuard g(&state_lock_);
     using namespace voicetastic;
     const auto &p = mp.decoded;
 
@@ -824,6 +894,7 @@ ProcessMessage VoicetasticModule::handleReceived(const meshtastic_MeshPacket &mp
 
 int32_t VoicetasticModule::runOnce()
 {
+    concurrency::LockGuard g(&state_lock_);
     using namespace voicetastic;
     const uint32_t now = millis();
 

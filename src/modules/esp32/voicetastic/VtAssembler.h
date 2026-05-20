@@ -144,6 +144,13 @@ class VtAssembler {
         std::vector<std::vector<uint8_t>> parity_shards;  // [parity_count][chunk_size]
         std::vector<bool> data_received;                  // [total_data]
         std::vector<bool> parity_received;                // [parity_count]
+
+        // Sidecar for the lone final-DATA case (spec §4). If a final-DATA frame
+        // arrives before chunk_size has been inferred, its body bytes are
+        // stashed here verbatim. As soon as chunk_size becomes known (via a
+        // later PARITY or non-final DATA), the sidecar is folded into
+        // data_shards[total_data-1] and cleared. Empty otherwise.
+        std::vector<uint8_t> last_data_pending;
     };
     AssemblyState states_[MAX_IN_PROGRESS];
 
