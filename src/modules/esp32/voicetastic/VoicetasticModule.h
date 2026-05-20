@@ -52,7 +52,7 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     // flight or the audio is too large for the current modem preset.
     bool enqueueOutbound(const uint8_t *audio, size_t audio_len,
                          voicetastic::CodecId codec, uint8_t codec_param,
-                         NodeNum to = NODENUM_BROADCAST);
+                         NodeNum to = NODENUM_BROADCAST, uint8_t channel = 0);
 
     bool isTransmitting() const { return tx_active; }
 
@@ -132,6 +132,8 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     uint16_t tx_next_chunk = 0;       // 0..(total_data + parity_count - 1)
     uint32_t tx_paced_until_ms = 0;
     NodeNum  tx_to = NODENUM_BROADCAST;
+    uint8_t  tx_channel = 0;          // Meshtastic channel index for the outbound message;
+                                      // also drives the channel PSK lookup that keys the header MAC.
 
     // Boot-time test broadcast: sent once a few seconds after boot to verify
     // the wire pipeline against voicetastic-desktop receivers. Phase 4 will

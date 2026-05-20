@@ -57,7 +57,7 @@ struct VtHeader {
     PacketType packet_type;
     bool       encrypted;
     bool       last_in_stream;
-    bool       mac_keyed;      // false for this build (we use SHA-256, not HMAC)
+    bool       mac_keyed;      // set by encodeHeader based on mac_key arg; read by decodeHeader from the flags byte
     uint32_t   message_id;
     CodecId    codec;
     uint8_t    codec_param;    // codec-specific ordinal
@@ -67,30 +67,40 @@ struct VtHeader {
     uint8_t    parity_count;
 };
 
-// Encode the 16-byte header into `out`. Computes the MAC over the first 12
-// bytes via SHA-256 (mac_keyed=false). Returns HEADER_SIZE on success or 0
-// if `h` violates a spec rejection rule that we can catch pre-emission:
+// Encode the 16-byte header into `out`. Computes the trailing 4-byte MAC.
+//   mac_key == nullptr or mac_key_len == 0:
+//       SHA-256(header[0..12])[..4]; the mac_keyed flag bit is cleared.
+//   mac_key != nullptr and mac_key_len > 0:
+//       HMAC-SHA256(mac_key, header[0..12])[..4]; the mac_keyed flag bit is set.
+// `h.mac_keyed` is overwritten to match the actual computation, so callers
+// don't have to keep the two in sync.
+// Returns HEADER_SIZE on success or 0 if `h` violates a spec rejection rule
+// catchable pre-emission:
 //   - h.version != 0x02
 //   - h.packet_type == RESERVED
 //   - h.total_data == 0 (except for NACK frames, which still echo a value)
 //   - h.parity_count > MAX_PARITY_PER_MESSAGE
-//   - mac_keyed == true (not supported by this build)
-//   - reserved bits 0..2 implicitly zero
-size_t encodeHeader(const VtHeader &h, uint8_t out[HEADER_SIZE]);
+size_t encodeHeader(VtHeader &h, uint8_t out[HEADER_SIZE],
+                    const uint8_t *mac_key = nullptr, size_t mac_key_len = 0);
 
 // Decode a 16-byte header. Returns true iff:
 //   - in[0] == 0x02
-//   - MAC tag matches SHA-256(in[0..12])[0..4]   (mac_keyed=0 path)
+//   - MAC tag matches the appropriate computation:
+//       header advertises mac_keyed=1 and mac_key != nullptr → HMAC-SHA256 compare;
+//       header advertises mac_keyed=1 and mac_key == nullptr → reject (cannot verify);
+//       header advertises mac_keyed=0 → SHA-256 compare, mac_key ignored.
 //   - packet_type != RESERVED
-//   - mac_keyed == 0  (HMAC variant not supported yet)
 //   - total_data != 0  (per spec §9.2 rejection rule)
 //   - parity_count <= MAX_PARITY_PER_MESSAGE
 // On false: `out` is left in an undefined state.
-bool decodeHeader(const uint8_t in[HEADER_SIZE], VtHeader &out);
+bool decodeHeader(const uint8_t in[HEADER_SIZE], VtHeader &out,
+                  const uint8_t *mac_key = nullptr, size_t mac_key_len = 0);
 
-// Compute the 4-byte MAC tag for a given 12-byte logical header.
-// Internal helper, exposed for test/debug use.
-void computeHeaderMac(const uint8_t header12[12], uint8_t out_tag[MAC_TAG_SIZE]);
+// Compute the 4-byte MAC tag for a given 12-byte logical header. If
+// `mac_key != nullptr && mac_key_len > 0`, computes HMAC-SHA256; otherwise
+// plain SHA-256. Internal helper, exposed for test/debug use.
+void computeHeaderMac(const uint8_t header12[12], uint8_t out_tag[MAC_TAG_SIZE],
+                      const uint8_t *mac_key = nullptr, size_t mac_key_len = 0);
 
 // Debug helper: dump a header in human-readable form to the log.
 void logHeader(const char *prefix, const VtHeader &h);

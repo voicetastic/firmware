@@ -6,6 +6,60 @@
 #include "NodeDB.h"
 #include "RadioInterface.h"
 #include "Router.h"
+#include "mesh/Channels.h"
+
+namespace {
+
+// Resolve the AES-key bytes that Meshtastic would use to encrypt this channel.
+// Mirrors Channels::getKey() (which is private in upstream): handles short-form
+// PSK expansion (1-byte index → defaultpsk + bump), secondary-without-key
+// fallback to primary, and zero-padding of short user-provided keys. Returns
+// true and fills `out` with up to 32 bytes; `out_len = 0` means the channel is
+// in plaintext mode ("User disabled encryption"). On disabled / invalid
+// channels returns false.
+//
+// Used as the HMAC-SHA256 key for the v2 header MAC (spec §3 / §7) so we stay
+// bit-compatible with voicetastic-desktop, which keys the same way.
+bool resolveChannelPsk(uint8_t channel, uint8_t out[32], size_t &out_len)
+{
+    const meshtastic_Channel &ch = channels.getByIndex(channel);
+    if (!ch.has_settings || ch.role == meshtastic_Channel_Role_DISABLED) {
+        out_len = 0;
+        return false;
+    }
+    const auto &ps = ch.settings.psk;
+    memset(out, 0, 32);
+
+    if (ps.size == 0) {
+        if (ch.role == meshtastic_Channel_Role_SECONDARY) {
+            // Inherit primary channel's key.
+            return resolveChannelPsk((uint8_t)channels.getPrimaryIndex(), out, out_len);
+        }
+        out_len = 0; // encryption disabled
+        return true;
+    }
+    if (ps.size == 1) {
+        const uint8_t pskIndex = ps.bytes[0];
+        if (pskIndex == 0) {
+            out_len = 0; // encryption disabled via short index 0
+            return true;
+        }
+        memcpy(out, defaultpsk, sizeof(defaultpsk));
+        // Per Channels::getKey: short index 1 = unchanged defaultpsk; higher
+        // indices bump the last byte.
+        out[sizeof(defaultpsk) - 1] = (uint8_t)(out[sizeof(defaultpsk) - 1] + pskIndex - 1);
+        out_len = sizeof(defaultpsk);
+        return true;
+    }
+    const size_t n = ps.size <= 32 ? (size_t)ps.size : 32;
+    memcpy(out, ps.bytes, n);
+    if (n < 16)               out_len = 16;       // AES128 zero-pad
+    else if (n < 32 && n != 16) out_len = 32;    // AES256 zero-pad
+    else                        out_len = n;
+    return true;
+}
+
+} // namespace
 #include "VtAudio.h"
 #include "VtProtocol.h"
 #include "concurrency/LockGuard.h"
@@ -71,7 +125,7 @@ VoicetasticModule::VoicetasticModule()
 
 bool VoicetasticModule::enqueueOutbound(const uint8_t *audio, size_t audio_len,
                                         voicetastic::CodecId codec, uint8_t codec_param,
-                                        NodeNum to)
+                                        NodeNum to, uint8_t channel)
 {
     using namespace voicetastic;
     if (tx_active) {
@@ -89,6 +143,7 @@ bool VoicetasticModule::enqueueOutbound(const uint8_t *audio, size_t audio_len,
     }
 
     tx_to = to;
+    tx_channel = channel;
     tx_next_chunk = 0;
     tx_paced_until_ms = 0;
     tx_active = true;
@@ -159,7 +214,7 @@ uint32_t VoicetasticModule::recordElapsedMs() const
     return millis() - rec_started_ms;
 }
 
-bool VoicetasticModule::sendPending(NodeNum to, uint8_t /*channel*/)
+bool VoicetasticModule::sendPending(NodeNum to, uint8_t channel)
 {
     using namespace voicetastic;
     if (pending_audio.empty()) return false;
@@ -170,7 +225,7 @@ bool VoicetasticModule::sendPending(NodeNum to, uint8_t /*channel*/)
     pending_audio.shrink_to_fit();
     if (audio.empty()) return false;
     return enqueueOutbound(audio.data(), audio.size(),
-                           CodecId::CODEC2, (uint8_t)codec2_mode, to);
+                           CodecId::CODEC2, (uint8_t)codec2_mode, to, channel);
 }
 
 void VoicetasticModule::discardPending()
@@ -534,7 +589,7 @@ void VoicetasticModule::sendOneChunk()
     h.packet_type    = is_data ? PacketType::DATA : PacketType::PARITY;
     h.encrypted      = false;
     h.last_in_stream = is_last_in_stream;
-    h.mac_keyed      = false;
+    h.mac_keyed      = false; // overwritten by encodeHeader based on the key arg
     h.message_id     = tx_msg.message_id;
     h.codec          = tx_msg.codec;
     h.codec_param    = tx_msg.codec_param;
@@ -543,8 +598,17 @@ void VoicetasticModule::sendOneChunk()
     h.total_data     = tx_msg.total_data;
     h.parity_count   = tx_msg.parity_count;
 
+    // Look up the channel PSK (expanded form) and use it as the keyed-MAC key
+    // when present. Spec §3 / §7: senders SHOULD use mac_keyed=1 whenever a
+    // channel PSK is available; receivers MUST accept both.
+    uint8_t psk_buf[32] = {0};
+    size_t  psk_len = 0;
+    resolveChannelPsk(tx_channel, psk_buf, psk_len);
+    const uint8_t *mac_key  = (psk_len > 0) ? psk_buf : nullptr;
+    const size_t   mac_klen = psk_len;
+
     uint8_t header_buf[HEADER_SIZE] = {0};
-    if (encodeHeader(h, header_buf) != HEADER_SIZE) {
+    if (encodeHeader(h, header_buf, mac_key, mac_klen) != HEADER_SIZE) {
         LOG_ERROR("Voicetastic: header encode failed (idx=%u)", (unsigned)idx);
         return;
     }
@@ -556,6 +620,7 @@ void VoicetasticModule::sendOneChunk()
 
     meshtastic_MeshPacket *p = allocDataPacket();
     p->to = tx_to;
+    p->channel = tx_channel;
     p->want_ack = false; // no NACK loop in this build
     p->decoded.want_response = false;
     p->priority = meshtastic_MeshPacket_Priority_DEFAULT;
@@ -588,10 +653,20 @@ ProcessMessage VoicetasticModule::handleReceived(const meshtastic_MeshPacket &mp
         return ProcessMessage::CONTINUE;
     }
 
+    // Resolve the inbound channel's PSK so we can verify keyed MACs. Frames
+    // advertising mac_keyed=1 on a channel where we have no PSK will be rejected
+    // by decodeHeader (no way to validate authenticity).
+    uint8_t rx_psk[32] = {0};
+    size_t  rx_psk_len = 0;
+    resolveChannelPsk(mp.channel, rx_psk, rx_psk_len);
+    const uint8_t *rx_key  = (rx_psk_len > 0) ? rx_psk : nullptr;
+    const size_t   rx_klen = rx_psk_len;
+
     VtHeader h{};
-    if (!decodeHeader(p.payload.bytes, h)) {
-        LOG_DEBUG("Voicetastic: header reject (ver=0x%02x size=%u)", (unsigned)p.payload.bytes[0],
-                  (unsigned)p.payload.size);
+    if (!decodeHeader(p.payload.bytes, h, rx_key, rx_klen)) {
+        LOG_DEBUG("Voicetastic: header reject (ver=0x%02x size=%u ch=%u keyed=%u)",
+                  (unsigned)p.payload.bytes[0], (unsigned)p.payload.size,
+                  (unsigned)mp.channel, (unsigned)((p.payload.bytes[1] & MASK_MAC_KEYED) != 0));
         return ProcessMessage::CONTINUE;
     }
 
