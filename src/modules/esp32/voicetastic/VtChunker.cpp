@@ -20,6 +20,10 @@ uint8_t chunkSizeForPreset(meshtastic_Config_LoRaConfig_ModemPreset preset)
     case P::meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_SLOW:
         return 160;
     case P::meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST:
+        // Per docs/wiki/Constants-and-Limits.md, LongFast tolerates a larger
+        // chunk than the older v2 spec table suggested (96). 199 matches the
+        // desktop reference and trims frame count ~2× on this preset.
+        return 199;
     case P::meshtastic_Config_LoRaConfig_ModemPreset_LONG_MODERATE:
     case P::meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW:
         return 96;
