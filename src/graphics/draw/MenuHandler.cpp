@@ -17,9 +17,6 @@
 #include "modules/AdminModule.h"
 #include "modules/CannedMessageModule.h"
 #include "modules/KeyVerificationModule.h"
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
-#include "modules/esp32/voicetastic/VoicetasticModule.h"
-#endif
 
 #include "modules/TraceRouteModule.h"
 #include <functional>
@@ -577,23 +574,13 @@ void menuHandler::textMessageBaseMenu()
 
 void menuHandler::systemBaseMenu()
 {
-    enum optionsNumbers {
-        Back, Notifications, ScreenOptions, Bluetooth, PowerMenu, FrameToggles, Test,
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
-        VoiceBitrate,
-#endif
-        enumEnd
-    };
+    enum optionsNumbers { Back, Notifications, ScreenOptions, Bluetooth, PowerMenu, FrameToggles, Test, enumEnd };
     static const char *optionsArray[enumEnd] = {"Back"};
     static int optionsEnumArray[enumEnd] = {Back};
     int options = 1;
 
     optionsArray[options] = "Notifications";
     optionsEnumArray[options++] = Notifications;
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
-    optionsArray[options] = "Voice Bitrate";
-    optionsEnumArray[options++] = VoiceBitrate;
-#endif
 #if defined(ST7789_CS) || defined(ST7796_CS) || defined(USE_OLED) || defined(USE_SSD1306) || defined(USE_SH1106) ||              \
     defined(USE_SH1107) || defined(HELTEC_MESH_NODE_T114) || defined(HELTEC_VISION_MASTER_T190) || HAS_TFT
     optionsArray[options] = "Screen Options";
@@ -633,11 +620,6 @@ void menuHandler::systemBaseMenu()
         if (selected == Notifications) {
             menuHandler::menuQueue = menuHandler::notifications_menu;
             screen->runNow();
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
-        } else if (selected == VoiceBitrate) {
-            menuHandler::menuQueue = menuHandler::voicetastic_bitrate_picker;
-            screen->runNow();
-#endif
         } else if (selected == ScreenOptions) {
             menuHandler::menuQueue = menuHandler::screen_options_menu;
             screen->runNow();
@@ -986,41 +968,6 @@ void menuHandler::BuzzerModeMenu()
     bannerOptions.InitialSelected = config.device.buzzer_mode;
     screen->showOverlayBanner(bannerOptions);
 }
-
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
-void menuHandler::VoicetasticBitrateMenu()
-{
-    // Order matches voicetastic::Codec2Mode ordinals (0..5), prefixed with a
-    // Back entry. Higher bitrates = better quality but ~3-5× the airtime per
-    // recording; M_1200 stays the LoRa-friendly default. The selection is
-    // persisted to NVS by setCodec2Mode() so it survives reboot.
-    static const char *optionsArray[] = {
-        "Back",
-        "3.2 kbps", "2.4 kbps", "1.6 kbps", "1.4 kbps", "1.3 kbps", "1.2 kbps"};
-    BannerOverlayOptions bannerOptions;
-    bannerOptions.message = "Voice Bitrate";
-    bannerOptions.optionsArrayPtr = optionsArray;
-    bannerOptions.optionsCount = 7;
-    bannerOptions.bannerCallback = [](int selected) -> void {
-        if (selected <= 0 || voicetasticModule == nullptr) return;
-        const auto mode = (voicetastic::Codec2Mode)(uint8_t)(selected - 1);
-        voicetasticModule->setCodec2Mode(mode);
-        // Brief confirmation toast — same array indexing as optionsArray.
-        static const char *confirmArray[] = {
-            "", // selected==0 is Back, handled above
-            "Voice: 3.2 kbps", "Voice: 2.4 kbps", "Voice: 1.6 kbps",
-            "Voice: 1.4 kbps", "Voice: 1.3 kbps", "Voice: 1.2 kbps"};
-        screen->showSimpleBanner(confirmArray[selected], 1500);
-    };
-    // InitialSelected = mode ordinal + 1 (offset for the Back entry).
-    if (voicetasticModule != nullptr) {
-        bannerOptions.InitialSelected = (uint8_t)voicetasticModule->getCodec2Mode() + 1;
-    } else {
-        bannerOptions.InitialSelected = 0;
-    }
-    screen->showOverlayBanner(bannerOptions);
-}
-#endif
 
 void menuHandler::BrightnessPickerMenu()
 {
@@ -1705,11 +1652,6 @@ void menuHandler::handleMenuSwitch(OLEDDisplay *display)
     case buzzermodemenupicker:
         BuzzerModeMenu();
         break;
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
-    case voicetastic_bitrate_picker:
-        VoicetasticBitrateMenu();
-        break;
-#endif
     case mui_picker:
         switchToMUIMenu();
         break;

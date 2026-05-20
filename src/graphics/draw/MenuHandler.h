@@ -44,10 +44,7 @@ class menuHandler
         trace_route_menu,
         throttle_message,
         node_name_length_menu,
-        FrameToggles,
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
-        voicetastic_bitrate_picker,
-#endif
+        FrameToggles
     };
     static screenMenus menuQueue;
 
@@ -72,9 +69,6 @@ class menuHandler
     static void GPSToggleMenu();
     static void GPSFormatMenu();
     static void BuzzerModeMenu();
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
-    static void VoicetasticBitrateMenu();
-#endif
     static void switchToMUIMenu();
     static void TFTColorPickerMenu(OLEDDisplay *display);
     static void nodeListMenu();
