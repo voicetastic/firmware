@@ -500,15 +500,34 @@ void VoicetasticModule::encoderTaskBody()
     // We're on the dedicated encoder task with 32 KB stack.
     int16_t pcm[VT_PCM_SAMPLES_PER_FRAME];
     uint8_t bits[16];
-    const int wanted = VtAudio::bytesPerCodec2Frame();
+    const int wanted_out = VtAudio::bytesPerCodec2Frame();
+    // The PCM file is captured at 320 samples/40ms chunks (mode 1200 size),
+    // but Codec2 frame size depends on mode: modes 3200/2400 want 160 samples
+    // per encode call, modes 1600..1200 want 320. Pull whatever the active
+    // encoder asks for — feeding 320 samples to a 160-sample encoder makes
+    // it silently drop the second half of every PCM chunk and produces the
+    // half-rate-garbled audio reported on higher bitrates.
+    const int codec_samples = VtAudio::samplesPerCodec2Frame();
+    const size_t codec_bytes_in = (size_t)codec_samples * sizeof(int16_t);
+    if (codec_samples <= 0 || codec_samples > VT_PCM_SAMPLES_PER_FRAME) {
+        LOG_ERROR("vtEncode: unexpected codec_samples=%d (max %d), aborting",
+                  codec_samples, (int)VT_PCM_SAMPLES_PER_FRAME);
+        if (rec_pcm_file) rec_pcm_file.close();
+        if (FSCom.exists(VT_PCM_PATH)) FSCom.remove(VT_PCM_PATH);
+        VtAudio::deinitEncoder();
+        encoder_done = true;
+        encoder_task = nullptr;
+        vTaskDelete(NULL);
+        return;
+    }
     uint32_t frame_count = 0;
 
-    while (rec_pcm_file && rec_pcm_file.available() >= (int)VT_PCM_BYTES_PER_FRAME) {
-        const size_t got = rec_pcm_file.read((uint8_t *)pcm, VT_PCM_BYTES_PER_FRAME);
-        if (got < VT_PCM_BYTES_PER_FRAME) break;
+    while (rec_pcm_file && rec_pcm_file.available() >= (int)codec_bytes_in) {
+        const size_t got = rec_pcm_file.read((uint8_t *)pcm, codec_bytes_in);
+        if (got < codec_bytes_in) break;
 
         VtAudio::encodeFrame(pcm, bits);
-        encoder_result_audio.insert(encoder_result_audio.end(), bits, bits + wanted);
+        encoder_result_audio.insert(encoder_result_audio.end(), bits, bits + wanted_out);
         frame_count++;
         if ((frame_count % 25) == 0) {
             LOG_DEBUG("vtEncode: %u/%u frames (%u bytes)",
