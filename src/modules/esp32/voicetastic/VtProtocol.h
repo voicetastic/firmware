@@ -17,6 +17,12 @@ static constexpr size_t   MAX_BODY_SIZE    = MAX_PACKET_SIZE - HEADER_SIZE; // 2
 static constexpr size_t   MAC_TAG_SIZE     = 4;
 static constexpr uint8_t  MAX_CHUNKS_PER_MESSAGE = 255;
 static constexpr uint8_t  MAX_PARITY_PER_MESSAGE = 128;
+// AES-256-GCM envelope (spec §7). Body when encrypted=1:
+//   12 B random nonce ‖ ciphertext (= plaintext len) ‖ 16 B tag.
+static constexpr size_t   GCM_NONCE_LEN  = 12;
+static constexpr size_t   GCM_TAG_LEN    = 16;
+static constexpr size_t   GCM_KEY_LEN    = 32;
+static constexpr size_t   MAX_PLAINTEXT_BODY = MAX_BODY_SIZE - GCM_NONCE_LEN - GCM_TAG_LEN; // 187
 
 // type_flags bit layout (spec Appendix B).
 static constexpr uint8_t  MASK_PACKET_TYPE   = 0xC0;  // bits 6-7
@@ -122,6 +128,38 @@ size_t encodeNackBody(uint8_t total_data, const bool *missing, bool give_up,
 // malformed body (wrong version, reserved-bit set, undersized buffer).
 bool decodeNackBody(const uint8_t *body, size_t body_len, uint8_t total_data,
                     bool *missing_out, bool &give_up_out);
+
+// Derive the AES-256-GCM envelope key for one voice message (spec §7).
+//   key = HKDF-SHA256(salt = channel_psk, ikm = message_id_be ‖ from_node_num_be,
+//                      info = "voicetastic/v2",  L = 32)
+// Returns true on success and fills `out_key[32]`. False on bad args or
+// mbedtls failure (e.g. psk == nullptr / psk_len == 0).
+bool deriveEnvelopeKey(const uint8_t *psk, size_t psk_len,
+                       uint32_t message_id, uint32_t from_node_num,
+                       uint8_t out_key[GCM_KEY_LEN]);
+
+// AES-256-GCM encrypt + authenticate.
+//   key      : 32 bytes (from deriveEnvelopeKey).
+//   nonce    : 12 bytes (random per frame).
+//   aad/aad_len : associated-data covered by the tag (spec §7: header[0..12]).
+//   plain    : plaintext input.
+//   ct_out   : ciphertext output (must hold plain_len bytes; may alias plain).
+//   tag_out  : 16-byte tag output.
+// Returns true on success.
+bool gcmEncrypt(const uint8_t key[GCM_KEY_LEN], const uint8_t nonce[GCM_NONCE_LEN],
+                const uint8_t *aad, size_t aad_len,
+                const uint8_t *plain, size_t plain_len,
+                uint8_t *ct_out, uint8_t tag_out[GCM_TAG_LEN]);
+
+// AES-256-GCM decrypt + verify.
+//   pt_out   : plaintext output (must hold ct_len bytes; may alias ct).
+// Returns true iff the tag verifies; on false `pt_out` is left in an
+// undefined state (callers MUST discard).
+bool gcmDecrypt(const uint8_t key[GCM_KEY_LEN], const uint8_t nonce[GCM_NONCE_LEN],
+                const uint8_t *aad, size_t aad_len,
+                const uint8_t *ct, size_t ct_len,
+                const uint8_t tag[GCM_TAG_LEN],
+                uint8_t *pt_out);
 
 // Debug helper: dump a header in human-readable form to the log.
 void logHeader(const char *prefix, const VtHeader &h);

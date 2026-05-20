@@ -136,7 +136,8 @@ bool VoicetasticModule::enqueueOutbound(const uint8_t *audio, size_t audio_len,
     const uint32_t mid = esp_random() | 1u; // non-zero u32 per spec §6
     const uint8_t  seq = stream_seq_counter++;
 
-    if (!buildOutbound(audio, audio_len, preset, codec, codec_param, mid, seq, tx_msg)) {
+    if (!buildOutbound(audio, audio_len, preset, codec, codec_param, mid, seq,
+                       tx_msg, envelope_enabled)) {
         LOG_ERROR("Voicetastic: buildOutbound failed (audio_len=%u preset=%d)",
                   (unsigned)audio_len, (int)preset);
         return false;
@@ -601,10 +602,21 @@ void VoicetasticModule::txSendShard(bool is_data, uint8_t idx, bool last_in_stre
 {
     using namespace voicetastic;
 
+    // Look up the channel PSK (expanded form). Used for two distinct purposes:
+    // (a) keyed header MAC (spec §3), and (b) HKDF salt for the AES-GCM envelope
+    // (spec §7). The envelope is only emitted when both the runtime flag is
+    // set AND the channel has a real PSK.
+    uint8_t psk_buf[32] = {0};
+    size_t  psk_len = 0;
+    resolveChannelPsk(tx_channel, psk_buf, psk_len);
+    const uint8_t *mac_key  = (psk_len > 0) ? psk_buf : nullptr;
+    const size_t   mac_klen = psk_len;
+    const bool use_envelope = envelope_enabled && psk_len > 0;
+
     VtHeader h{};
     h.version        = PROTOCOL_VERSION;
     h.packet_type    = is_data ? PacketType::DATA : PacketType::PARITY;
-    h.encrypted      = false;
+    h.encrypted      = use_envelope;
     h.last_in_stream = last_in_stream;
     h.mac_keyed      = false; // overwritten by encodeHeader based on the key arg
     h.message_id     = tx_msg.message_id;
@@ -615,24 +627,15 @@ void VoicetasticModule::txSendShard(bool is_data, uint8_t idx, bool last_in_stre
     h.total_data     = tx_msg.total_data;
     h.parity_count   = tx_msg.parity_count;
 
-    // Look up the channel PSK (expanded form) and use it as the keyed-MAC key
-    // when present. Spec §3 / §7: senders SHOULD use mac_keyed=1 whenever a
-    // channel PSK is available; receivers MUST accept both.
-    uint8_t psk_buf[32] = {0};
-    size_t  psk_len = 0;
-    resolveChannelPsk(tx_channel, psk_buf, psk_len);
-    const uint8_t *mac_key  = (psk_len > 0) ? psk_buf : nullptr;
-    const size_t   mac_klen = psk_len;
-
     uint8_t header_buf[HEADER_SIZE] = {0};
     if (encodeHeader(h, header_buf, mac_key, mac_klen) != HEADER_SIZE) {
         LOG_ERROR("Voicetastic: header encode failed (idx=%u)", (unsigned)idx);
         return;
     }
 
-    // Determine body size: trimmed for final DATA, full for all others.
+    // Plaintext body: trimmed for final DATA, full for all others.
     const std::vector<uint8_t> &src = is_data ? tx_msg.data[idx] : tx_msg.parity[idx];
-    const size_t body_len =
+    const size_t plain_len =
         (is_data && idx == tx_msg.total_data - 1) ? tx_msg.last_data_real_size : (size_t)tx_msg.chunk_size;
 
     meshtastic_MeshPacket *p = allocDataPacket();
@@ -642,21 +645,68 @@ void VoicetasticModule::txSendShard(bool is_data, uint8_t idx, bool last_in_stre
     p->decoded.want_response = false;
     p->priority = meshtastic_MeshPacket_Priority_DEFAULT;
 
-    const size_t total = HEADER_SIZE + body_len;
-    if (total > sizeof(p->decoded.payload.bytes)) {
-        LOG_ERROR("Voicetastic: chunk too large (%u)", (unsigned)total);
-        // Allocated packet must be freed; in this codebase service->sendToMesh
-        // takes ownership only on send. Fall through with size=0 to avoid leak.
-        p->decoded.payload.size = 0;
-    } else {
+    size_t body_on_wire = 0;
+    if (use_envelope) {
+        // Plaintext must fit inside (MAX_BODY_SIZE - nonce - tag).
+        if (plain_len > MAX_PLAINTEXT_BODY) {
+            LOG_ERROR("Voicetastic: envelope plaintext too large (%u > %u)",
+                      (unsigned)plain_len, (unsigned)MAX_PLAINTEXT_BODY);
+            p->decoded.payload.size = 0;
+            return;
+        }
+        uint8_t key32[GCM_KEY_LEN];
+        // `from_node_num` is the local node's id — spec §7 binds the key to it.
+        const uint32_t from_node = nodeDB->getNodeNum();
+        if (!deriveEnvelopeKey(psk_buf, psk_len, h.message_id, from_node, key32)) {
+            LOG_ERROR("Voicetastic: envelope key derivation failed");
+            p->decoded.payload.size = 0;
+            return;
+        }
+        uint8_t nonce[GCM_NONCE_LEN];
+        // 12 random bytes (96-bit nonce); esp_random() gives us 32 bits at a time.
+        for (size_t i = 0; i < GCM_NONCE_LEN; i += 4) {
+            const uint32_t r = esp_random();
+            const size_t take = (GCM_NONCE_LEN - i) >= 4 ? 4 : (GCM_NONCE_LEN - i);
+            memcpy(nonce + i, &r, take);
+        }
+        // wire body = nonce(12) ‖ ciphertext(plain_len) ‖ tag(16)
+        const size_t needed = HEADER_SIZE + GCM_NONCE_LEN + plain_len + GCM_TAG_LEN;
+        if (needed > sizeof(p->decoded.payload.bytes)) {
+            LOG_ERROR("Voicetastic: envelope frame too large (%u)", (unsigned)needed);
+            p->decoded.payload.size = 0;
+            return;
+        }
         memcpy(p->decoded.payload.bytes, header_buf, HEADER_SIZE);
-        memcpy(p->decoded.payload.bytes + HEADER_SIZE, src.data(), body_len);
+        memcpy(p->decoded.payload.bytes + HEADER_SIZE, nonce, GCM_NONCE_LEN);
+        // AAD = header[0..12], per spec §7.
+        if (!gcmEncrypt(key32, nonce,
+                        header_buf, HEADER_SIZE - MAC_TAG_SIZE,
+                        src.data(), plain_len,
+                        p->decoded.payload.bytes + HEADER_SIZE + GCM_NONCE_LEN,
+                        p->decoded.payload.bytes + HEADER_SIZE + GCM_NONCE_LEN + plain_len)) {
+            LOG_ERROR("Voicetastic: GCM encrypt failed");
+            p->decoded.payload.size = 0;
+            return;
+        }
+        body_on_wire = GCM_NONCE_LEN + plain_len + GCM_TAG_LEN;
+        p->decoded.payload.size = HEADER_SIZE + body_on_wire;
+    } else {
+        const size_t total = HEADER_SIZE + plain_len;
+        if (total > sizeof(p->decoded.payload.bytes)) {
+            LOG_ERROR("Voicetastic: chunk too large (%u)", (unsigned)total);
+            p->decoded.payload.size = 0;
+            return;
+        }
+        memcpy(p->decoded.payload.bytes, header_buf, HEADER_SIZE);
+        memcpy(p->decoded.payload.bytes + HEADER_SIZE, src.data(), plain_len);
+        body_on_wire = plain_len;
         p->decoded.payload.size = total;
     }
 
-    LOG_DEBUG("Voicetastic: tx mid=%08x %s ci=%u/%u body=%u",
+    LOG_DEBUG("Voicetastic: tx mid=%08x %s ci=%u/%u body=%u%s",
               (unsigned)h.message_id, is_data ? "D" : "P",
-              (unsigned)h.chunk_index, (unsigned)tx_msg.total_data, (unsigned)body_len);
+              (unsigned)h.chunk_index, (unsigned)tx_msg.total_data,
+              (unsigned)body_on_wire, use_envelope ? " enc" : "");
     service->sendToMesh(p);
 }
 
@@ -810,11 +860,52 @@ ProcessMessage VoicetasticModule::handleReceived(const meshtastic_MeshPacket &mp
         return ProcessMessage::CONTINUE;
     }
 
+    // If the sender wrapped the body in an AES-GCM envelope (spec §7),
+    // decrypt it before handing off to the assembler. We keep the plaintext
+    // in a stack buffer sized for one frame body.
+    const uint8_t *body_ptr = p.payload.bytes + HEADER_SIZE;
+    size_t         body_use_len = body_len;
+    uint8_t        decrypted_buf[MAX_PLAINTEXT_BODY];
+    if (h.encrypted) {
+        if (rx_psk_len == 0) {
+            LOG_DEBUG("Voicetastic: dropping encrypted frame mid=%08x on PSK-less channel",
+                      (unsigned)h.message_id);
+            return ProcessMessage::CONTINUE;
+        }
+        if (body_len < GCM_NONCE_LEN + GCM_TAG_LEN) {
+            LOG_WARN("Voicetastic: encrypted body too short (%u)", (unsigned)body_len);
+            return ProcessMessage::CONTINUE;
+        }
+        const size_t ct_len = body_len - GCM_NONCE_LEN - GCM_TAG_LEN;
+        if (ct_len > sizeof(decrypted_buf)) {
+            LOG_WARN("Voicetastic: encrypted ciphertext too large (%u)", (unsigned)ct_len);
+            return ProcessMessage::CONTINUE;
+        }
+        uint8_t key32[GCM_KEY_LEN];
+        if (!deriveEnvelopeKey(rx_psk, rx_psk_len, h.message_id, mp.from, key32)) {
+            LOG_WARN("Voicetastic: HKDF failed for mid=%08x", (unsigned)h.message_id);
+            return ProcessMessage::CONTINUE;
+        }
+        // AAD = header[0..12] per spec §7.
+        if (!gcmDecrypt(key32,
+                        /*nonce=*/ p.payload.bytes + HEADER_SIZE,
+                        /*aad=*/ p.payload.bytes, HEADER_SIZE - MAC_TAG_SIZE,
+                        /*ct=*/ p.payload.bytes + HEADER_SIZE + GCM_NONCE_LEN, ct_len,
+                        /*tag=*/ p.payload.bytes + HEADER_SIZE + GCM_NONCE_LEN + ct_len,
+                        decrypted_buf)) {
+            LOG_WARN("Voicetastic: GCM auth failed mid=%08x ci=%u",
+                     (unsigned)h.message_id, (unsigned)h.chunk_index);
+            return ProcessMessage::CONTINUE;
+        }
+        body_ptr = decrypted_buf;
+        body_use_len = ct_len;
+    }
+
     // Hand DATA / PARITY frames to the per-(from, message_id) assembler. It
     // deals with shard storage, chunk_size inference (spec §4), FEC
     // reconstruction, and queuing complete messages for playback (Phase 6).
     if (assembler.acceptFrame(mp.from, mp.to, mp.channel, h,
-                              p.payload.bytes + HEADER_SIZE, body_len)) {
+                              body_ptr, body_use_len)) {
         // A new message was just completed. Phase 6 will drain the assembler's
         // complete-queue into the playback engine; for now we just leave it
         // sitting there so anyone polling popComplete() can pick it up.

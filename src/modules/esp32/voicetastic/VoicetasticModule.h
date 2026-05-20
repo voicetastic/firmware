@@ -85,6 +85,14 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     voicetastic::Codec2Mode getCodec2Mode() const { return codec2_mode; }
     void setCodec2Mode(voicetastic::Codec2Mode mode) { codec2_mode = mode; }
 
+    // AES-256-GCM envelope (spec §7) on outbound frames. When enabled AND the
+    // outbound channel has a PSK, each DATA / PARITY body is wrapped as
+    // `nonce(12) ‖ ciphertext ‖ tag(16)` with a per-message HKDF-derived key.
+    // Receive-side decryption is always attempted on frames whose `encrypted`
+    // bit is set, regardless of this flag. NACK frames are never encrypted.
+    bool isEnvelopeEnabled() const { return envelope_enabled; }
+    void setEnvelopeEnabled(bool on) { envelope_enabled = on; }
+
     // Mini-player API. Received voice messages no longer auto-play; instead
     // they accumulate in pending_play_queue and the chat-screen widget drives
     // playback explicitly via these calls.
@@ -159,6 +167,14 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
 #define VOICETASTIC_CODEC2_MODE voicetastic::Codec2Mode::M_1200
 #endif
     voicetastic::Codec2Mode codec2_mode = VOICETASTIC_CODEC2_MODE;
+
+    // AES-256-GCM envelope opt-in (spec §7). Default off so the firmware keeps
+    // interoperating with v2 senders that don't encrypt. Build flag override:
+    // -DVOICETASTIC_DEFAULT_GCM_ENVELOPE=1 flips the default on.
+#ifndef VOICETASTIC_DEFAULT_GCM_ENVELOPE
+#define VOICETASTIC_DEFAULT_GCM_ENVELOPE 0
+#endif
+    bool envelope_enabled = (VOICETASTIC_DEFAULT_GCM_ENVELOPE != 0);
 
     // SD-buffered recording state.
     //
