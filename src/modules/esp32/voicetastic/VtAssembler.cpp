@@ -28,12 +28,13 @@ VtAssembler::AssemblyState *VtAssembler::allocateSlot(NodeNum from, uint32_t mes
             return &s;
         }
     }
-    // No free slot: evict the oldest in-progress (per spec §9.1 eviction policy,
-    // simplified — we don't blacklist).
+    // No free slot: evict the oldest in-progress (spec §9.1) and blacklist its
+    // key so late shards from the evicted message don't immediately re-allocate.
     AssemblyState *oldest = &states_[0];
     for (auto &s : states_) {
         if ((int32_t)(s.started_ms - oldest->started_ms) < 0) oldest = &s;
     }
+    addToBlacklist(oldest->from, oldest->message_id, millis());
     resetSlot(*oldest);
     oldest->in_use = true;
     oldest->from = from;
@@ -61,6 +62,50 @@ size_t VtAssembler::inProgressCount() const
     return n;
 }
 
+bool VtAssembler::isBlacklisted(NodeNum from, uint32_t message_id, uint32_t now_ms)
+{
+    for (auto &e : blacklist_) {
+        if (!e.in_use) continue;
+        // Lazy expiry: drop on lookup once the TTL elapses, so we don't have to
+        // walk the ring on every tick. `expires_ms - now_ms` wraps cleanly as a
+        // signed delta even across the 49-day millis() wraparound.
+        if ((int32_t)(e.expires_ms - now_ms) <= 0) {
+            e.in_use = false;
+            continue;
+        }
+        if (e.from == from && e.message_id == message_id) return true;
+    }
+    return false;
+}
+
+void VtAssembler::addToBlacklist(NodeNum from, uint32_t message_id, uint32_t now_ms)
+{
+    // Don't double-insert: if it's already there, refresh the expiry instead.
+    for (auto &e : blacklist_) {
+        if (e.in_use && e.from == from && e.message_id == message_id) {
+            e.expires_ms = now_ms + BLACKLIST_TTL_MS;
+            return;
+        }
+    }
+    // Prefer an expired/unused slot before overwriting fresh entries.
+    for (auto &e : blacklist_) {
+        if (!e.in_use || (int32_t)(e.expires_ms - now_ms) <= 0) {
+            e.in_use = true;
+            e.from = from;
+            e.message_id = message_id;
+            e.expires_ms = now_ms + BLACKLIST_TTL_MS;
+            return;
+        }
+    }
+    // All slots fresh: round-robin overwrite at blacklist_next.
+    BlacklistEntry &e = blacklist_[blacklist_next];
+    blacklist_next = (blacklist_next + 1) % BLACKLIST_MAX;
+    e.in_use = true;
+    e.from = from;
+    e.message_id = message_id;
+    e.expires_ms = now_ms + BLACKLIST_TTL_MS;
+}
+
 bool VtAssembler::acceptFrame(NodeNum from, NodeNum to, uint8_t channel,
                               const VtHeader &h, const uint8_t *body, size_t body_len)
 {
@@ -75,6 +120,12 @@ bool VtAssembler::acceptFrame(NodeNum from, NodeNum to, uint8_t channel,
     if (h.packet_type == PacketType::DATA && h.chunk_index >= h.total_data) return false;
     if (h.packet_type == PacketType::PARITY && h.chunk_index >= h.parity_count) return false;
     if (body_len == 0 || body_len > MAX_BODY_SIZE) return false;
+
+    const uint32_t now_ms = millis();
+    if (isBlacklisted(from, h.message_id, now_ms)) {
+        // Spec §9.1: already-finalized message; ignore late drain shards.
+        return false;
+    }
 
     AssemblyState *s = findExisting(from, h.message_id);
     if (s == nullptr) {
@@ -250,6 +301,10 @@ void VtAssembler::publish(AssemblyState &s)
     complete_tail = (complete_tail + 1) % MAX_COMPLETE_QUEUE;
     complete_count++;
 
+    // Spec §9.1: remember this (from, message_id) so late shards from the
+    // sender's drain queue don't restart a phantom partial reassembly.
+    addToBlacklist(s.from, s.message_id, millis());
+
     resetSlot(s);
 }
 
@@ -270,6 +325,9 @@ void VtAssembler::tick(uint32_t now_ms)
             LOG_WARN("vtAssembler: mid=%08x timed out at %u/%u shards",
                      (unsigned)s.message_id, (unsigned)s.received_data_count,
                      (unsigned)s.total_data);
+            // Spec §9.1: a partial timeout is still a finalization for blacklist
+            // purposes — late shards must not resurrect this assembly.
+            addToBlacklist(s.from, s.message_id, now_ms);
             resetSlot(s);
         }
     }

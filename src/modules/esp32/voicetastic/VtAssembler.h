@@ -57,6 +57,26 @@ class VtAssembler {
     static constexpr int  MAX_COMPLETE_QUEUE = 4;     // recent received messages
     static constexpr uint32_t TIMEOUT_MS = 30000;     // drop a stuck assembly after 30 s
 
+    // Completion-memory blacklist (spec §9.1). After we finalize a message —
+    // complete OR partial-timeout — we remember (from, message_id) for
+    // BLACKLIST_TTL_MS so late-arriving shards from the sender's drain queue
+    // can't resurrect a phantom partial reassembly. Spec recommends 600 s;
+    // BLACKLIST_MAX is sized below the spec's 100 to bound RAM on the device.
+    static constexpr int      BLACKLIST_MAX = 16;
+    static constexpr uint32_t BLACKLIST_TTL_MS = 600000;
+
+    struct BlacklistEntry {
+        bool     in_use = false;
+        NodeNum  from = 0;
+        uint32_t message_id = 0;
+        uint32_t expires_ms = 0;
+    };
+    BlacklistEntry blacklist_[BLACKLIST_MAX];
+    size_t         blacklist_next = 0;   // FIFO write cursor; replaces oldest when full
+
+    bool isBlacklisted(NodeNum from, uint32_t message_id, uint32_t now_ms);
+    void addToBlacklist(NodeNum from, uint32_t message_id, uint32_t now_ms);
+
     struct AssemblyState {
         bool       in_use = false;
         NodeNum    from;
