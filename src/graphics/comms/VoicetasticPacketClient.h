@@ -2,7 +2,7 @@
 
 #include "configuration.h"
 
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC && HAS_TFT
+#if defined(ARCH_ESP32) && defined(HAS_VOICETASTIC) && !MESHTASTIC_EXCLUDE_VOICETASTIC && HAS_TFT
 
 #include "comms/PacketClient.h"
 

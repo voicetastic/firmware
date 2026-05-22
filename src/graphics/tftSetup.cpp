@@ -9,7 +9,7 @@
 #include "graphics/DeviceScreen.h"
 #include "graphics/driver/DisplayDriverConfig.h"
 
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
+#if defined(ARCH_ESP32) && defined(HAS_VOICETASTIC) && !MESHTASTIC_EXCLUDE_VOICETASTIC
 #include "graphics/comms/VoicetasticPacketClient.h"
 #endif
 
@@ -43,7 +43,7 @@ void tftSetup(void)
 #ifndef ARCH_PORTDUINO
     deviceScreen = &DeviceScreen::create();
     PacketAPI::create(PacketServer::init());
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
+#if defined(ARCH_ESP32) && defined(HAS_VOICETASTIC) && !MESHTASTIC_EXCLUDE_VOICETASTIC
     // Bridge that exposes Voicetastic record/send hooks to the device-ui chat screen.
     deviceScreen->init(new VoicetasticPacketClient);
 #else

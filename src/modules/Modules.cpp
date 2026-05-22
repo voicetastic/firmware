@@ -87,7 +87,7 @@
 #if defined(USE_SX1280) && !MESHTASTIC_EXCLUDE_AUDIO
 #include "modules/esp32/AudioModule.h"
 #endif
-#if !MESHTASTIC_EXCLUDE_VOICETASTIC
+#if defined(HAS_VOICETASTIC) && !MESHTASTIC_EXCLUDE_VOICETASTIC
 #include "modules/esp32/voicetastic/VoicetasticModule.h"
 #endif
 #if !MESHTASTIC_EXCLUDE_PAXCOUNTER
@@ -287,7 +287,7 @@ void setupModules()
 #if defined(USE_SX1280) && !MESHTASTIC_EXCLUDE_AUDIO
     audioModule = new AudioModule();
 #endif
-#if !MESHTASTIC_EXCLUDE_VOICETASTIC
+#if defined(HAS_VOICETASTIC) && !MESHTASTIC_EXCLUDE_VOICETASTIC
     voicetasticModule = new VoicetasticModule();
 #endif
 #if !MESHTASTIC_EXCLUDE_PAXCOUNTER

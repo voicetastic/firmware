@@ -2,7 +2,7 @@
 
 #include "configuration.h"
 
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
+#if defined(ARCH_ESP32) && defined(HAS_VOICETASTIC) && !MESHTASTIC_EXCLUDE_VOICETASTIC
 
 #include <stdint.h>
 #include <stddef.h>
@@ -105,7 +105,9 @@ size_t encodeNackBody(uint8_t total_data, const bool *missing, bool give_up,
 // Parse a NACK body. `total_data` MUST be the value echoed from the originating
 // stream's header so the caller knows the bitmap width. Returns true on success
 // and fills `missing_out` (length `total_data`) plus `give_up_out`. False on
-// malformed body (wrong version, reserved-bit set, undersized buffer).
+// malformed body — wrong version, reserved-bit set, or `body_len` not exactly
+// `2 + ceil(total_data/8)` (no trailing bytes accepted; see decodeNackBody for
+// the rationale).
 bool decodeNackBody(const uint8_t *body, size_t body_len, uint8_t total_data,
                     bool *missing_out, bool &give_up_out);
 

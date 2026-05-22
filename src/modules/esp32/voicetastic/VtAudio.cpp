@@ -1,6 +1,6 @@
 #include "VtAudio.h"
 
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
+#if defined(ARCH_ESP32) && defined(HAS_VOICETASTIC) && !MESHTASTIC_EXCLUDE_VOICETASTIC
 
 #include "audio_drivers/es7210.h"
 #include "configuration.h"
@@ -19,7 +19,8 @@ namespace {
 // chain we care about so this is essentially exclusive ownership.
 constexpr i2s_port_t   kI2sPort = I2S_NUM_1;
 
-bool s_initialized = false;
+bool s_initialized = false;       // ES7210 chip is configured + powered
+bool s_i2s_rx_installed = false;  // I2S RX driver currently owns its pins
 
 // Scratch buffer for one read of raw 16 kHz interleaved (2-channel) samples
 // before decimation. Sized for ~40 ms of audio = 640 input samples per call.
@@ -42,13 +43,95 @@ int s_codec2_dec_bytes   = 0;
 constexpr i2s_port_t kDacI2sPort = I2S_NUM_0;
 bool s_dac_initialized = false;
 
+// Three-sample history for the readPcm decimation FIR. Declared at file
+// scope so installMicI2s() can reset it when the RX path is (re)opened
+// — otherwise stale samples from a previous session leak into the first
+// post-reclaim frame.
+int16_t s_fir_history[3] = {0, 0, 0};
+// Tap weights, Q15. Sum = 32768 to preserve unity DC gain after >>15.
+//   h ≈ [0.10, 0.40, 0.40, 0.10] — a windowed-sinc approximation
+//   for a half-band response with fc ≈ 3.4 kHz at fs = 16 kHz.
+const int32_t kFir[4] = {3277, 13107, 13107, 3277};
+
 } // namespace
 
 bool VtAudio::isMicReady() { return s_initialized; }
 
+// Install and pin-bind the I2S RX driver. Assumes the ES7210 chip is already
+// configured upstream so its I2S output is live and we just need to start
+// listening. Used by both initMic() (full bring-up) and reclaimMicI2sOnly()
+// (post-playback handoff). Returns true on success.
+static bool installMicI2s()
+{
+    i2s_config_t i2s_cfg = {};
+    i2s_cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+    i2s_cfg.sample_rate = VtAudio::CAPTURE_RATE_HZ;
+    i2s_cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+    i2s_cfg.channel_format = I2S_CHANNEL_FMT_ALL_LEFT;
+    i2s_cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+    i2s_cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+    i2s_cfg.dma_buf_count = 8;
+    i2s_cfg.dma_buf_len = 64;
+    i2s_cfg.use_apll = false;
+    i2s_cfg.tx_desc_auto_clear = true;
+    i2s_cfg.fixed_mclk = 0;
+    i2s_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+    i2s_cfg.bits_per_chan = I2S_BITS_PER_CHAN_16BIT;
+    i2s_cfg.chan_mask = (i2s_channel_t)(I2S_TDM_ACTIVE_CH0 | I2S_TDM_ACTIVE_CH1);
+
+    if (i2s_driver_install(kI2sPort, &i2s_cfg, 0, NULL) != ESP_OK) {
+        LOG_ERROR("VtAudio: i2s_driver_install failed");
+        return false;
+    }
+
+    i2s_pin_config_t pins = {};
+    pins.bck_io_num   = ES7210_SCK;
+    pins.ws_io_num    = ES7210_LRCK;
+    pins.data_in_num  = ES7210_DIN;
+    pins.data_out_num = I2S_PIN_NO_CHANGE;
+    pins.mck_io_num   = ES7210_MCLK;
+
+    if (i2s_set_pin(kI2sPort, &pins) != ESP_OK) {
+        LOG_ERROR("VtAudio: i2s_set_pin failed");
+        i2s_driver_uninstall(kI2sPort);
+        return false;
+    }
+    i2s_zero_dma_buffer(kI2sPort);
+    // Reset FIR history so the first samples after a (re)claim don't carry
+    // stale state from the previous session.
+    s_fir_history[0] = s_fir_history[1] = s_fir_history[2] = 0;
+    s_i2s_rx_installed = true;
+    return true;
+}
+
+// I2S-only teardown: uninstall the driver and put the shared pins back to a
+// neutral state. The ES7210 chip is left configured and powered; only the
+// ESP32-side I2S peripheral is released. No I2C traffic here, so this is
+// safe to run concurrently with the TFT keyboard scanner.
+static void uninstallMicI2s()
+{
+    if (!s_i2s_rx_installed) return;
+    i2s_driver_uninstall(kI2sPort);
+    // GPIO 21 is shared between ES7210_LRCK and DAC_I2S_MCLK. The legacy I2S
+    // driver leaves pins configured as outputs after uninstall, which causes
+    // the next install on the same pin to fail. Force the shared pins back
+    // to INPUT so the DAC (or a future re-install of the mic itself) can
+    // grab them cleanly.
+    pinMode(ES7210_SCK, INPUT);
+    pinMode(ES7210_DIN, INPUT);
+    pinMode(ES7210_LRCK, INPUT);   // == GPIO 21, shared with DAC_I2S_MCLK
+    pinMode(ES7210_MCLK, INPUT);
+    s_i2s_rx_installed = false;
+}
+
 bool VtAudio::initMic()
 {
-    if (s_initialized) return true;
+    if (s_initialized) {
+        // Chip is up; the I2S driver may or may not be (e.g. after playback
+        // released it). Make sure RX is active before returning success.
+        if (s_i2s_rx_installed) return true;
+        return installMicI2s();
+    }
 
     // Wire is brought up earlier in boot for the keyboard; calling begin()
     // again with the same pins is a no-op on arduino-esp32.
@@ -85,40 +168,7 @@ bool VtAudio::initMic()
         return false;
     }
 
-    i2s_config_t i2s_cfg = {};
-    i2s_cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
-    i2s_cfg.sample_rate = CAPTURE_RATE_HZ;
-    i2s_cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-    i2s_cfg.channel_format = I2S_CHANNEL_FMT_ALL_LEFT;
-    i2s_cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-    i2s_cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-    i2s_cfg.dma_buf_count = 8;
-    i2s_cfg.dma_buf_len = 64;
-    i2s_cfg.use_apll = false;
-    i2s_cfg.tx_desc_auto_clear = true;
-    i2s_cfg.fixed_mclk = 0;
-    i2s_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
-    i2s_cfg.bits_per_chan = I2S_BITS_PER_CHAN_16BIT;
-    i2s_cfg.chan_mask = (i2s_channel_t)(I2S_TDM_ACTIVE_CH0 | I2S_TDM_ACTIVE_CH1);
-
-    if (i2s_driver_install(kI2sPort, &i2s_cfg, 0, NULL) != ESP_OK) {
-        LOG_ERROR("VtAudio: i2s_driver_install failed");
-        return false;
-    }
-
-    i2s_pin_config_t pins = {};
-    pins.bck_io_num   = ES7210_SCK;
-    pins.ws_io_num    = ES7210_LRCK;
-    pins.data_in_num  = ES7210_DIN;
-    pins.data_out_num = I2S_PIN_NO_CHANGE;
-    pins.mck_io_num   = ES7210_MCLK;
-
-    if (i2s_set_pin(kI2sPort, &pins) != ESP_OK) {
-        LOG_ERROR("VtAudio: i2s_set_pin failed");
-        i2s_driver_uninstall(kI2sPort);
-        return false;
-    }
-    i2s_zero_dma_buffer(kI2sPort);
+    if (!installMicI2s()) return false;
 
     s_initialized = true;
     LOG_INFO("VtAudio: ES7210 initialized; capture %d Hz -> decimate to %d Hz",
@@ -128,28 +178,55 @@ bool VtAudio::initMic()
 
 void VtAudio::deinitMic()
 {
-    if (!s_initialized) return;
-    i2s_driver_uninstall(kI2sPort);
+    // Full teardown: I2S off, then power the chip down via I2C. The chip
+    // power-down sequence drives I2C traffic during the codec's analog
+    // transition, which races destructively with the TFT-task keyboard
+    // scanner. Only call this from a context where you can guarantee no
+    // other I2C user is active (e.g. before reboot, never at runtime).
+    if (!s_initialized) {
+        uninstallMicI2s();
+        return;
+    }
+    uninstallMicI2s();
     es7210_adc_deinit();
-    // GPIO 21 is shared between ES7210_LRCK and DAC_I2S_MCLK. The legacy I2S
-    // driver leaves pins configured as outputs after uninstall, which causes
-    // the next install on the same pin to fail. Force the shared pins back
-    // to a neutral input state so the DAC (or a future re-init of the mic
-    // itself) can grab them cleanly.
-    pinMode(ES7210_SCK, INPUT);
-    pinMode(ES7210_DIN, INPUT);
-    pinMode(ES7210_LRCK, INPUT);   // == GPIO 21, shared with DAC_I2S_MCLK
-    pinMode(ES7210_MCLK, INPUT);
     s_initialized = false;
 }
 
+void VtAudio::releaseMicI2sOnly()
+{
+    uninstallMicI2s();
+}
+
+bool VtAudio::reclaimMicI2sOnly()
+{
+    if (!s_initialized) {
+        LOG_ERROR("VtAudio: reclaimMicI2sOnly called before chip init");
+        return false;
+    }
+    if (s_i2s_rx_installed) return true;
+    return installMicI2s();
+}
+
+// 4-tap symmetric FIR low-pass + 2:1 decimation. State and coefficients are
+// declared in the anonymous namespace above so the I2S-only reclaim path can
+// reset the history between sessions.
+//
+// Two-tap averaging (the previous implementation) has a sinc response with
+// only ~4 dB of attenuation at the 4 kHz Nyquist of the decimated 8 kHz
+// stream, so energy from 4-8 kHz aliases back into the speech band at
+// moderate amplitude — audible as "swishy" sibilants in Codec2 output.
+// This FIR puts the −20 dB point near 4.5 kHz and rolls off hard above.
+//
+// We keep 3 input samples of history across calls so the filter's tail
+// straddles call boundaries without producing a step discontinuity per call.
 size_t VtAudio::readPcm(int16_t *out, size_t max_samples, uint32_t timeout_ms)
 {
     if (!s_initialized || out == nullptr || max_samples == 0) return 0;
 
     // We want `max_samples` 8 kHz mono samples. ES7210 delivers two-channel
-    // interleaved at 16 kHz: 4 input samples per output sample (2 channels × 2
-    // for decimation). Read CH0 only, decimate 2:1 by averaging adjacent pairs.
+    // interleaved at 16 kHz; we read CH0 (even indices) and decimate 2:1
+    // with the FIR above. 4 input samples per output sample (2 channels ×
+    // 2:1 decimation).
     const size_t want_input_samples = max_samples * DECIMATION * 2; // *2 for stereo interleave
     const size_t take = (want_input_samples < kScratchMax) ? want_input_samples : kScratchMax;
 
@@ -159,14 +236,31 @@ size_t VtAudio::readPcm(int16_t *out, size_t max_samples, uint32_t timeout_ms)
         return 0;
     }
     const size_t samples_read = bytes_read / sizeof(int16_t);
-    // Indices 0,2,4,... are CH0 (16 kHz). Decimate 2:1 by averaging
-    // (samples_in[0]+samples_in[2])/2, (samples_in[4]+samples_in[6])/2, ...
+    // Extract every other sample (CH0 only) into a flat 16 kHz mono stream,
+    // then apply the FIR + 2:1 decimation. The three-sample history makes
+    // filtering at call boundaries continuous.
     size_t produced = 0;
-    for (size_t i = 0; i + 4 <= samples_read && produced < max_samples; i += 4, produced++) {
-        int32_t a = s_scratch[i];
-        int32_t b = s_scratch[i + 2];
-        out[produced] = (int16_t)((a + b) / 2);
+    int16_t h0 = s_fir_history[0], h1 = s_fir_history[1], h2 = s_fir_history[2];
+    for (size_t i = 0; i + 4 <= samples_read && produced < max_samples; i += 4) {
+        const int16_t s_a = s_scratch[i];     // 16 kHz sample N   (CH0)
+        const int16_t s_b = s_scratch[i + 2]; // 16 kHz sample N+1 (CH0)
+        // Two FIR outputs at 16 kHz, then drop the second to get 8 kHz.
+        // For 2:1 decimation we only need to compute the *kept* output,
+        // which uses the four samples [h1, h2, s_a, s_b].
+        const int32_t y = (int32_t)h1 * kFir[0] + (int32_t)h2 * kFir[1] +
+                          (int32_t)s_a * kFir[2] + (int32_t)s_b * kFir[3];
+        int32_t y_q = y >> 15;
+        if (y_q > 32767) y_q = 32767;
+        else if (y_q < -32768) y_q = -32768;
+        out[produced++] = (int16_t)y_q;
+        // Advance history: keep the newest three CH0 samples for next call.
+        h0 = h2;
+        h1 = s_a;
+        h2 = s_b;
     }
+    s_fir_history[0] = h0;
+    s_fir_history[1] = h1;
+    s_fir_history[2] = h2;
     return produced;
 }
 
@@ -314,10 +408,34 @@ void VtAudio::deinitDac()
 size_t VtAudio::writePcm(const int16_t *pcm, size_t samples)
 {
     if (!s_dac_initialized || pcm == nullptr || samples == 0) return 0;
-    size_t bytes_written = 0;
-    i2s_write(kDacI2sPort, pcm, samples * sizeof(int16_t), &bytes_written,
-              pdMS_TO_TICKS(500));
-    return bytes_written / sizeof(int16_t);
+
+    // The legacy i2s_write returns ESP_OK with a partial `bytes_written` count
+    // if the timeout fires before all bytes are queued into DMA. If the caller
+    // (playbackTaskBody) advances its `consumed` pointer unconditionally by
+    // samples_per_frame, a partial write would skip audio and the output
+    // would glitch. Retry the remainder up to a small bounded total so the
+    // partial-then-advance trap can't fire.
+    //
+    // Bound: per-call timeout 60 ms (1.5x typical 40 ms write of 320 samples
+    // into 64 ms of DMA buffer), retry up to 3 times for a worst-case 180 ms.
+    // That's the cap for a "stuck DAC" — much tighter than the old 500 ms
+    // single-shot timeout, and we cleanly return a short count when it
+    // really is stuck so the playback worker can abort.
+    const size_t total_bytes = samples * sizeof(int16_t);
+    size_t       written_bytes = 0;
+    const uint8_t *p = reinterpret_cast<const uint8_t *>(pcm);
+    for (int attempt = 0; attempt < 3 && written_bytes < total_bytes; ++attempt) {
+        size_t this_written = 0;
+        const esp_err_t err = i2s_write(kDacI2sPort,
+                                        p + written_bytes,
+                                        total_bytes - written_bytes,
+                                        &this_written,
+                                        pdMS_TO_TICKS(60));
+        written_bytes += this_written;
+        if (err != ESP_OK) break;
+        if (this_written == 0) break; // genuinely stuck — caller will see short
+    }
+    return written_bytes / sizeof(int16_t);
 }
 
 } // namespace voicetastic

@@ -2,7 +2,18 @@
 
 #include "configuration.h"
 
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
+#if defined(ARCH_ESP32) && defined(HAS_VOICETASTIC) && !MESHTASTIC_EXCLUDE_VOICETASTIC
+
+// Voicetastic's RS-encoded outbound message can pin (total_data + parity_count)
+// × chunk_size of heap simultaneously — up to ~76 KB at SHORT presets, plus
+// the audio buffer, plus the encoder result. The T-Deck has 8 MB of PSRAM
+// and that's where these live in practice; on a non-PSRAM board the peak
+// would push us into OOM territory even with the smaller LongFast preset.
+// Require an explicit PSRAM declaration from the variant so we fail fast at
+// build time rather than at field-deploy.
+#if !defined(BOARD_HAS_PSRAM)
+#error "HAS_VOICETASTIC requires BOARD_HAS_PSRAM. Either define BOARD_HAS_PSRAM in the variant's platformio.ini, or unset HAS_VOICETASTIC."
+#endif
 
 #include "FSCommon.h" // FSCom (LittleFS) for buffering raw PCM during capture
 #include "SinglePortModule.h"
@@ -13,6 +24,7 @@
 #include "concurrency/OSThread.h"
 #include "mesh/MeshTypes.h"
 #include "mesh/generated/meshtastic/portnums.pb.h"
+#include <atomic>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <vector>
@@ -48,6 +60,14 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
 {
   public:
     VoicetasticModule();
+
+    // IMPORTANT: do NOT set loopbackOk = true on this module. Our state_lock_
+    // is non-recursive; broadcast TX synchronously fan-outs through
+    // MeshService::sendToMesh -> Router::sendLocal -> Router::handleReceived
+    // -> MeshModule::callModules, and a loopback-enabled module would have its
+    // handleReceived() re-entered on the same task while runOnce() still holds
+    // the lock — deadlock. The default loopbackOk=false (MeshModule.h) is
+    // load-bearing here.
 
     // Queue an outbound message. Builds + FEC-encodes + chunks, then drives
     // the runOnce() TX loop. Returns false if another message is already in
@@ -156,6 +176,12 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
                                NodeNum to, uint8_t channel);
     void stopRecordingLocked();
 
+    // Set by the constructor if BOARD_HAS_PSRAM is declared but no PSRAM is
+    // actually mapped at boot. While true, every public entry point and
+    // runOnce() returns immediately so we don't try to allocate the big
+    // shard / audio buffers in DRAM. Read-only after construction; no lock.
+    bool psram_missing = false;
+
     // TX state. One in-flight message at a time in this iteration.
     voicetastic::OutboundMessage tx_msg{};
     bool     tx_active = false;
@@ -172,7 +198,37 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     // walk in sendOneChunk; once it empties and the linger expires, tx_active
     // is cleared.
     static constexpr uint32_t TX_NACK_LINGER_MS = 8000;
-    std::vector<uint8_t> tx_retransmit_idx;  // FIFO of data chunk indices to re-send
+    // FIFO of data chunk indices to re-send in response to inbound NACKs.
+    // We use a vector + head index rather than std::deque (heavier per-node
+    // allocator overhead on libstdc++) or repeated `erase(begin())` (O(n)
+    // per pop). The head advances on each retransmit; the storage is
+    // squashed back to [head..end()) only when it grows large, keeping pop
+    // amortized O(1). Treat `tx_retransmit_idx` as a black box — all access
+    // goes through the helpers below.
+    std::vector<uint8_t> tx_retransmit_idx;
+    size_t               tx_retransmit_head = 0;
+
+    bool   retransmitEmpty() const { return tx_retransmit_head >= tx_retransmit_idx.size(); }
+    size_t retransmitSize() const  { return tx_retransmit_idx.size() - tx_retransmit_head; }
+    void   retransmitClear() { tx_retransmit_idx.clear(); tx_retransmit_head = 0; }
+    uint8_t retransmitPop() {
+        const uint8_t v = tx_retransmit_idx[tx_retransmit_head++];
+        // Compact when the dead prefix dominates the live tail; keeps the
+        // backing storage from growing unboundedly under long NACK loops.
+        if (tx_retransmit_head > 16 && tx_retransmit_head * 2 >= tx_retransmit_idx.size()) {
+            tx_retransmit_idx.erase(tx_retransmit_idx.begin(),
+                                    tx_retransmit_idx.begin() + tx_retransmit_head);
+            tx_retransmit_head = 0;
+        }
+        return v;
+    }
+    bool retransmitContains(uint8_t i) const {
+        for (size_t k = tx_retransmit_head; k < tx_retransmit_idx.size(); ++k) {
+            if (tx_retransmit_idx[k] == i) return true;
+        }
+        return false;
+    }
+    void retransmitPush(uint8_t i) { tx_retransmit_idx.push_back(i); }
     uint32_t tx_linger_until_ms = 0;         // 0 while still inside the linear walk
 
     // Boot-time test broadcast: sent once a few seconds after boot to verify
@@ -182,6 +238,13 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     uint32_t boot_ms = 0;
 
     uint8_t  stream_seq_counter = 0;
+    // Reservation boundary: stream_seq_counter may consume values up to (but
+    // not including) stream_seq_reserved_end without touching NVS. When it
+    // hits the boundary, we write the next block's end to NVS and advance.
+    // Initialised by the constructor's NVS-resume path; never wraps explicitly
+    // — uint8_t arithmetic handles the 256-wrap fine since we only compare
+    // counter == reserved_end as the trigger.
+    uint8_t  stream_seq_reserved_end = 0;
 
     // Active outbound codec2 mode. Initialised from the build flag
     // VOICETASTIC_CODEC2_MODE (default M_1200) and mutable at runtime via
@@ -216,8 +279,15 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     // stack; reads PCM from FSCom, runs codec2_encode frame by frame on its
     // own stack, drops the result into encoder_result_audio, and self-deletes.
     // The loop task polls encoder_done in eRecEncoding state.
+    //
+    // encoder_done is std::atomic so the encoder task's store and the loop
+    // task's load are properly ordered against the surrounding writes /
+    // reads of encoder_result_audio. `volatile` (the previous type) is not
+    // a memory barrier under the C++ memory model — the compiler is free to
+    // sink encoder_result_audio writes past the volatile store, with no
+    // diagnostic. std::atomic with release/acquire prevents that.
     std::vector<uint8_t>  encoder_result_audio;
-    volatile bool         encoder_done = false;
+    std::atomic<bool>     encoder_done{false};
     TaskHandle_t          encoder_task = nullptr;
 
     static void encoderTaskTrampoline(void *self);
@@ -227,9 +297,21 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
     // to a chat-screen mini-player click. Worker tears down the mic, brings
     // the DAC up, decodes codec2 frame-by-frame, writes PCM to I2S, tears the
     // DAC back down and re-inits the mic on exit.
+    // Cross-call PCM accumulator for the on-disk recording. `i2s_read` is
+    // free to return short of the requested sample count when the requested
+    // wall-time exceeds the timeout, so we accumulate samples across runOnce
+    // ticks until we have a full frame, then flush to LittleFS. Without
+    // this, a 30 ms i2s_read timeout against a 40 ms-wall-time request
+    // would silently drop every frame.
+    int16_t  rec_pcm_accum[320];   // VT_PCM_SAMPLES_PER_FRAME; static-sized to keep off the stack
+    uint16_t rec_pcm_accum_n = 0;  // current fill level in samples (0..320)
+
     bool                  playing = false;
-    volatile bool         playback_done = false;
-    volatile bool         playback_stop_requested = false;
+    // Same rationale as encoder_done: cross-task signaling needs std::atomic
+    // for the C++ memory model to guarantee ordering against the worker's
+    // writes to playback_msg / play_started_ms.
+    std::atomic<bool>     playback_done{false};
+    std::atomic<bool>     playback_stop_requested{false};
     TaskHandle_t          playback_task = nullptr;
     voicetastic::ReceivedVoiceMessage playback_msg;
     uint32_t              play_started_ms = 0;   // millis() when worker started writing PCM

@@ -158,12 +158,17 @@ void CryptoEngine::setDHPrivateKey(uint8_t *_private_key)
  */
 void CryptoEngine::hash(uint8_t *bytes, size_t numBytes)
 {
+    // Note: the previous `uint8_t size = numBytes` silently truncated inputs
+    // ≥ 256 bytes (size wrapped to numBytes % 256, hashing only the tail).
+    // No current caller passes that much (NodeDB passes 32, VtProtocol passes
+    // 12, PortduinoGlue passes 8), so no behaviour change is visible — but a
+    // future caller hashing e.g. a 512-byte buffer would have hit the
+    // truncation without a diagnostic. Use size_t throughout.
     SHA256 hash;
-    size_t posn;
-    uint8_t size = numBytes;
-    uint8_t inc = 16;
+    const size_t size = numBytes;
+    const size_t inc = 16;
     hash.reset();
-    for (posn = 0; posn < size; posn += inc) {
+    for (size_t posn = 0; posn < size; posn += inc) {
         size_t len = size - posn;
         if (len > inc)
             len = inc;

@@ -1,6 +1,6 @@
 #include "VtProtocol.h"
 
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
+#if defined(ARCH_ESP32) && defined(HAS_VOICETASTIC) && !MESHTASTIC_EXCLUDE_VOICETASTIC
 
 #include "CryptoEngine.h"
 #include "configuration.h"
@@ -126,7 +126,13 @@ bool decodeNackBody(const uint8_t *body, size_t body_len, uint8_t total_data,
 {
     if (body == nullptr || missing_out == nullptr || total_data == 0) return false;
     const size_t bitmap_len = ((size_t)total_data + 7u) / 8u;
-    if (body_len < 2 + bitmap_len) return false;
+    // Exact-size match. The encoder side writes exactly `2 + bitmap_len`
+    // bytes; tolerating trailing bytes here would silently accept malformed
+    // peers (or attacker-crafted padding) instead of surfacing the divergence.
+    // If/when nack_version is bumped to add fields, this check will need to
+    // become "match a version-keyed expected length" — but for v1 it's a
+    // straight equality.
+    if (body_len != 2 + bitmap_len) return false;
     if (body[0] != NACK_VERSION) return false;
     if ((body[1] & ~NACK_FLAG_GIVE_UP) != 0) return false; // reserved bits
 

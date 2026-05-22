@@ -2,7 +2,7 @@
 
 #include "configuration.h"
 
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
+#if defined(ARCH_ESP32) && defined(HAS_VOICETASTIC) && !MESHTASTIC_EXCLUDE_VOICETASTIC
 
 #include "VtChunker.h"   // for Codec2Mode
 #include <stdint.h>
@@ -30,12 +30,32 @@ public:
     static constexpr int  OUTPUT_RATE_HZ  = 8000;      // post-decimation rate, fed to Codec2
     static constexpr int  DECIMATION      = CAPTURE_RATE_HZ / OUTPUT_RATE_HZ;
 
-    // Initialize ES7210 over I2C and the I2S RX driver. Idempotent; subsequent
-    // calls after success are no-ops. Returns true on success.
+    // Full mic bring-up: configure the ES7210 chip over I2C *and* install the
+    // I2S RX driver. Idempotent; safe to call repeatedly. Use this once at
+    // boot (or first record) only.
+    //
+    // Splitting note: the chip-level init/teardown (es7210_adc_init /
+    // es7210_adc_deinit) involves I2C traffic during the chip's analog power
+    // transitions, which races destructively with concurrent I2C activity
+    // from the TFT-task keyboard scanner. After boot, prefer the I2S-only
+    // helpers below — they leave the chip running and only flip the I2S
+    // driver/pin ownership, which is what playback actually needs in order
+    // to share GPIO 21 between ES7210_LRCK and DAC_I2S_MCLK.
     static bool initMic();
 
     // Has initMic() succeeded?
     static bool isMicReady();
+
+    // I2S-only release: tear down the I2S RX driver and put the shared pins
+    // back to INPUT, but leave the ES7210 chip powered and configured. Use
+    // before bringing the DAC up so we don't touch the I2C bus mid-flight.
+    static void releaseMicI2sOnly();
+
+    // I2S-only reclaim: re-install the I2S RX driver and re-bind the pins
+    // on the chip that's already been initialized. The chip continues to
+    // stream its I2S output the whole time; we just stop and re-start
+    // listening to it.
+    static bool reclaimMicI2sOnly();
 
     // Read up to `max_samples` int16 PCM samples at OUTPUT_RATE_HZ (8 kHz mono)
     // into `out`. Blocks up to `timeout_ms`. Returns the number of samples

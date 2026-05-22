@@ -1,6 +1,6 @@
 #include "VtAssembler.h"
 
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
+#if defined(ARCH_ESP32) && defined(HAS_VOICETASTIC) && !MESHTASTIC_EXCLUDE_VOICETASTIC
 
 #include "configuration.h"
 #include "rs/rs.h"
@@ -209,9 +209,21 @@ bool VtAssembler::acceptFrame(NodeNum from, NodeNum to, uint8_t channel,
             // Lone final-DATA frame arrived first; defer chunk_size discovery
             // (spec §4). Stash the body verbatim in the sidecar so we can fold
             // it into data_shards once chunk_size becomes known. A retransmit
-            // of the same final-DATA simply overwrites the stash (same bytes).
+            // of the same final-DATA with the same length is fine — it just
+            // overwrites identical bytes. A retransmit with a different length
+            // is a sender bug or tampering; reject without disturbing the
+            // already-stashed copy.
             if (body_len > MAX_BODY_SIZE) return false;
-            s->last_data_real_size = body_len;
+            if (s->last_data_seen) {
+                if (body_len != s->last_data_real_size) {
+                    LOG_WARN("vtAssembler: mid=%08x stashed final-DATA len drift %u vs %u — drop",
+                             (unsigned)h.message_id, (unsigned)body_len,
+                             (unsigned)s->last_data_real_size);
+                    return false;
+                }
+            } else {
+                s->last_data_real_size = body_len;
+            }
             s->last_data_seen = true;
             s->last_data_pending.assign(body, body + body_len);
             return false;
@@ -222,7 +234,23 @@ bool VtAssembler::acceptFrame(NodeNum from, NodeNum to, uint8_t channel,
     if (h.packet_type == PacketType::DATA) {
         if (is_final_data) {
             if (body_len > s->chunk_size) return false;
-            if (!s->last_data_seen) s->last_data_real_size = body_len;
+            // Final-DATA retransmits MUST carry the same trimmed length as
+            // the first copy we accepted. A sender bug (or attacker tampering)
+            // delivering a different length would otherwise rewrite the shard
+            // bytes against a different boundary while we keep the original
+            // last_data_real_size — finalize would then emit audio that's
+            // length-consistent with the header but byte-corrupt at the tail.
+            // Drop the frame instead.
+            if (s->last_data_seen) {
+                if (body_len != s->last_data_real_size) {
+                    LOG_WARN("vtAssembler: mid=%08x final-DATA len drift %u vs %u — drop",
+                             (unsigned)h.message_id, (unsigned)body_len,
+                             (unsigned)s->last_data_real_size);
+                    return false;
+                }
+            } else {
+                s->last_data_real_size = body_len;
+            }
             s->last_data_seen = true;
         } else {
             if (body_len != s->chunk_size) return false;

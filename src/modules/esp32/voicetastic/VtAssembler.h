@@ -2,7 +2,7 @@
 
 #include "configuration.h"
 
-#if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_VOICETASTIC
+#if defined(ARCH_ESP32) && defined(HAS_VOICETASTIC) && !MESHTASTIC_EXCLUDE_VOICETASTIC
 
 #include "VtProtocol.h"
 #include "mesh/MeshTypes.h"
@@ -89,7 +89,12 @@ class VtAssembler {
     bool pollPendingNack(PendingNack &out, uint32_t now_ms);
 
   private:
-    static constexpr int  MAX_IN_PROGRESS = 4;        // per-sender * 1 sender in MVP
+    // In-progress slots are keyed by (from, message_id), so this is the
+    // total number of concurrent inbound assemblies across all senders, not
+    // a per-sender quota. Eviction is FIFO (allocateSlot evicts the oldest
+    // by `started_ms` when the table is full), with the evicted key going
+    // into the blacklist so its late drain shards don't restart it.
+    static constexpr int  MAX_IN_PROGRESS = 4;
     static constexpr int  MAX_COMPLETE_QUEUE = 4;     // recent received messages
     static constexpr uint32_t TIMEOUT_MS = 30000;     // absolute drop-dead for a stuck assembly
 
