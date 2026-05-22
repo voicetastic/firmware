@@ -134,7 +134,11 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
                              bool &played) const;
 
     // True when there's a captured-but-unsent audio buffer waiting to be sent.
-    bool hasPending() const { concurrency::LockGuard g(&state_lock_); return !pending_audio.empty(); }
+    bool hasPending() const {
+        concurrency::LockGuard g(&state_lock_);
+        // Either we have RAM-backed bytes or an SD-backed outbox file.
+        return !pending_audio.empty() || pending_audio_on_sd;
+    }
 
     // Send the held audio to the chosen destination. Returns false if there's
     // no held audio or TX is already in progress.
@@ -273,7 +277,17 @@ class VoicetasticModule : public SinglePortModule, private concurrency::OSThread
 
     // "Armed" audio: Codec2 bytes captured but not yet sent. The chat screen
     // sends it explicitly via sendPending() once the user presses ENTER.
+    //
+    // When the SD inbox is available, the encoder flushes the bytes to
+    // /voicetastic_outbox.c2 on SD after finishing — pending_audio stays
+    // empty, pending_audio_size carries the byte count, and pending_audio_on_sd
+    // is true. This saves up to ~55 KB of PSRAM during the "armed but not
+    // yet sent" window, which can be unbounded (the user can let a captured
+    // message sit indefinitely before pressing send). When SD isn't
+    // available we keep the bytes in pending_audio as before.
     std::vector<uint8_t>  pending_audio;
+    size_t                pending_audio_size = 0;
+    bool                  pending_audio_on_sd = false;
 
     // One-shot encoder worker task. Spawned by stopRecording with a 32 KB
     // stack; reads PCM from FSCom, runs codec2_encode frame by frame on its

@@ -6,7 +6,9 @@
 #include "NodeDB.h"
 #include "RadioInterface.h"
 #include "Router.h"
+#include "SPILock.h"
 #include "VtAudio.h"
+#include "VtInbox.h"
 #include "VtProtocol.h"
 #include "concurrency/LockGuard.h"
 #include "memGet.h"
@@ -130,6 +132,14 @@ VoicetasticModule::VoicetasticModule()
     runProtocolSelfTest();
     voicetastic::rs::runSelfTest();
     boot_ms = millis();
+
+    // Initialise the SD-backed inbox if HAS_SDCARD and a card is actually
+    // mounted. Wipes any stale audio files from a previous session — we
+    // don't yet persist mini-player state across reboots. If SD is absent,
+    // received messages will fall back to RAM via ReceivedVoiceMessage::audio.
+    if (voicetastic::inbox::init()) {
+        voicetastic::inbox::clearAll();
+    }
 
     // Bring the ES7210 chip up *once*, here, so the only I2C traffic to the
     // codec at runtime is the I2S-only swap during playback handoff. Doing
@@ -289,7 +299,17 @@ bool VoicetasticModule::startRecording(uint32_t duration_ms, NodeNum to)
         return false;
     }
 
-    if (!pending_audio.empty()) discardPending();
+    if (!pending_audio.empty() || pending_audio_on_sd) {
+        // discardPending() takes the lock — we're already holding it, so
+        // inline the cleanup instead. (state_lock_ is non-recursive.)
+        pending_audio.clear();
+        pending_audio.shrink_to_fit();
+        if (pending_audio_on_sd) {
+            voicetastic::inbox::outboxClear();
+            pending_audio_on_sd = false;
+        }
+        pending_audio_size = 0;
+    }
 
     // The chip is brought up in the constructor and stays resident; the only
     // thing we might need to do here is re-install the I2S driver if the
@@ -329,12 +349,42 @@ bool VoicetasticModule::sendPending(NodeNum to, uint8_t channel)
 {
     concurrency::LockGuard g(&state_lock_);
     using namespace voicetastic;
-    if (pending_audio.empty()) return false;
+    if (pending_audio.empty() && !pending_audio_on_sd) return false;
     if (tx_active) { LOG_WARN("Voicetastic: TX busy; cannot send pending audio yet"); return false; }
 
-    std::vector<uint8_t> audio = std::move(pending_audio);
-    pending_audio.clear();
-    pending_audio.shrink_to_fit();
+    // Materialise the audio into a transient vector for buildOutbound.
+    // SD-backed: read the outbox file into a temp buffer (peak memory during
+    // the send window, same as the RAM-backed case). RAM-backed: just move
+    // out of pending_audio.
+    std::vector<uint8_t> audio;
+    if (pending_audio_on_sd) {
+#if defined(HAS_SDCARD)
+        File f = voicetastic::inbox::outboxOpenRead();
+        if (!f) {
+            LOG_ERROR("Voicetastic: outbox read open failed; cannot send");
+            return false;
+        }
+        audio.resize(pending_audio_size);
+        size_t got = 0;
+        {
+            concurrency::LockGuard spi_g(spiLock);
+            got = f.read(audio.data(), pending_audio_size);
+            f.close();
+        }
+        if (got != pending_audio_size) {
+            LOG_ERROR("Voicetastic: outbox short read %u/%u; cannot send",
+                      (unsigned)got, (unsigned)pending_audio_size);
+            return false;
+        }
+        voicetastic::inbox::outboxClear();
+        pending_audio_on_sd = false;
+#endif
+    } else {
+        audio = std::move(pending_audio);
+        pending_audio.clear();
+        pending_audio.shrink_to_fit();
+    }
+    pending_audio_size = 0;
     if (audio.empty()) return false;
     return enqueueOutboundLocked(audio.data(), audio.size(),
                                  CodecId::CODEC2, (uint8_t)codec2_mode, to, channel);
@@ -345,6 +395,11 @@ void VoicetasticModule::discardPending()
     concurrency::LockGuard g(&state_lock_);
     pending_audio.clear();
     pending_audio.shrink_to_fit();
+    if (pending_audio_on_sd) {
+        voicetastic::inbox::outboxClear();
+        pending_audio_on_sd = false;
+    }
+    pending_audio_size = 0;
 }
 
 void VoicetasticModule::stopRecording()
@@ -456,7 +511,9 @@ static uint32_t vtEstimateDurationMs(const voicetastic::ReceivedVoiceMessage &ms
     if (msg.codec == voicetastic::CodecId::CODEC2)
         vtCodec2FrameInfo((voicetastic::Codec2Mode)msg.codec_param, bpf, spf);
     if (bpf == 0) return 0;
-    const uint32_t frames = (uint32_t)(msg.audio.size() / (size_t)bpf);
+    // audio_size is authoritative whether the bytes live in msg.audio (RAM
+    // fallback) or in the SD inbox — both paths set it at publish time.
+    const uint32_t frames = (uint32_t)(msg.audio_size / (size_t)bpf);
     return (frames * (uint32_t)spf) / 8; // samples_per_frame * 1000 / 8000 simplified
 }
 
@@ -467,9 +524,12 @@ bool VoicetasticModule::startPlayback(const voicetastic::ReceivedVoiceMessage &m
     using namespace voicetastic;
     if (playing) return false;
     if (rec_state != eRecIdle) return false;     // can't play while recording/encoding
-    if (msg.audio.empty()) return false;
+    // The message can be RAM-backed (audio vector non-empty) or SD-backed
+    // (audio_size > 0 and the worker streams from /voicetastic_inbox/...).
+    // Reject only the genuinely-empty case.
+    if (msg.audio_size == 0) return false;
 
-    playback_msg = msg; // copy in (vector copy)
+    playback_msg = msg; // copy metadata; if RAM-backed, also copies the vector
     playback_done = false;
     playback_stop_requested = false;
     play_from_node = msg.from;
@@ -483,6 +543,7 @@ bool VoicetasticModule::startPlayback(const voicetastic::ReceivedVoiceMessage &m
         LOG_ERROR("Voicetastic: failed to create playback task (rc=%d)", (int)rc);
         playback_task = nullptr;
         playback_msg.audio.clear();
+        playback_msg.audio_size = 0;
         play_total_ms = 0;
         play_from_node = 0;
         play_message_id = 0;
@@ -617,10 +678,34 @@ void VoicetasticModule::playbackTaskBody()
     const int bytes_per_frame   = VtAudio::bytesPerDecodedFrame();
 
     int16_t pcm[640];   // ample for any Codec2 mode (max 320 @ mode 1200)
-    const uint8_t *src = playback_msg.audio.data();
-    const size_t   total = playback_msg.audio.size();
+
+    // The audio bytes can live in playback_msg.audio (RAM fallback) or in
+    // /voicetastic_inbox/<message_id>.c2 on SD. RAM-backed reads from a
+    // pointer + offset; SD-backed reads from a File in batches.
+    const bool     ram_backed = !playback_msg.audio.empty();
+    const uint8_t *src = ram_backed ? playback_msg.audio.data() : nullptr;
+    const size_t   total = playback_msg.audio_size;
     size_t         consumed = 0;
     uint32_t       frame_count = 0;
+
+    File sd_file;
+    constexpr int   kBatchFrames = 16;  // matches encoder-task batching cadence
+    std::vector<uint8_t> sd_batch;
+    size_t          sd_batch_len = 0;
+    size_t          sd_batch_pos = 0;
+
+    if (!ram_backed) {
+        sd_file = inbox::open(playback_msg.message_id);
+        if (!sd_file) {
+            LOG_ERROR("vtPlay: SD open for mid=%08x failed", (unsigned)playback_msg.message_id);
+            VtAudio::deinitDecoder();
+            VtAudio::deinitDac();
+            playback_done = true;
+            vTaskDelete(NULL);
+            return;
+        }
+        sd_batch.resize((size_t)bytes_per_frame * (size_t)kBatchFrames);
+    }
 
     // Sub-frame write granularity. With a 64-sample DMA buffer at 8 kHz the
     // hardware drains at 8 ms / 64 samples. Writing in 80-sample chunks
@@ -637,7 +722,22 @@ void VoicetasticModule::playbackTaskBody()
             LOG_INFO("vtPlay: stop requested, exiting at frame %u", (unsigned)frame_count);
             break;
         }
-        VtAudio::decodeFrame(src + consumed, pcm);
+        const uint8_t *frame_bytes;
+        if (ram_backed) {
+            frame_bytes = src + consumed;
+        } else {
+            // Refill the SD batch when we run out. Reads happen under spiLock
+            // because the SD card and TFT share the SPI bus.
+            if (sd_batch_pos + (size_t)bytes_per_frame > sd_batch_len) {
+                concurrency::LockGuard spi_g(spiLock);
+                sd_batch_len = sd_file.read(sd_batch.data(), sd_batch.size());
+                sd_batch_pos = 0;
+                if (sd_batch_len < (size_t)bytes_per_frame) break; // EOF
+            }
+            frame_bytes = sd_batch.data() + sd_batch_pos;
+            sd_batch_pos += (size_t)bytes_per_frame;
+        }
+        VtAudio::decodeFrame(frame_bytes, pcm);
         for (int off = 0; off < samples_per_frame; off += kWriteChunkSamples) {
             if (playback_stop_requested) break;
             const int n = (off + kWriteChunkSamples <= samples_per_frame)
@@ -655,9 +755,15 @@ void VoicetasticModule::playbackTaskBody()
         consumed += bytes_per_frame;
         frame_count++;
         if ((frame_count % 25) == 0) {
-            LOG_DEBUG("vtPlay: decoded %u frames (%u/%u bytes)",
-                      (unsigned)frame_count, (unsigned)consumed, (unsigned)total);
+            LOG_DEBUG("vtPlay: decoded %u frames (%u/%u bytes %s)",
+                      (unsigned)frame_count, (unsigned)consumed, (unsigned)total,
+                      ram_backed ? "RAM" : "SD");
         }
+    }
+
+    if (sd_file) {
+        concurrency::LockGuard spi_g(spiLock);
+        sd_file.close();
     }
 
     // Drain the DMA before tearing the DAC down.
@@ -1062,13 +1168,18 @@ int32_t VoicetasticModule::runOnce()
     }
     ReceivedVoiceMessage rxmsg;
     while (assembler.popComplete(rxmsg)) {
-        LOG_INFO("Voicetastic: voice from 0x%08x queued for play (%u bytes)",
-                 (unsigned)rxmsg.from, (unsigned)rxmsg.audio.size());
+        LOG_INFO("Voicetastic: voice from 0x%08x queued for play (%u bytes %s)",
+                 (unsigned)rxmsg.from, (unsigned)rxmsg.audio_size,
+                 rxmsg.audio.empty() ? "SD" : "RAM");
         pending_play_queue.push_back(std::move(rxmsg));
-        // Cap the inbox so a flood of voice messages doesn't OOM. ~16 entries
-        // at ~5 KB/30 s gives a worst-case 80 KB resident, comfortably inside
-        // our PSRAM/free-heap budget.
+        // Cap the inbox so a flood of voice messages doesn't OOM. ~16 entries.
+        // With SD-backed audio the per-entry RAM cost is just ~120 B of
+        // metadata; only the SD-side files grow per message (and clear on
+        // eviction). The RAM-fallback path keeps the original ~80 KB cap.
         while (pending_play_queue.size() > kMaxInbox) {
+            // Delete the SD file (if any) for the evicted message so we
+            // don't leak it on disk.
+            voicetastic::inbox::erase(pending_play_queue.front().message_id);
             pending_play_queue.erase(pending_play_queue.begin());
         }
     }
@@ -1102,13 +1213,45 @@ int32_t VoicetasticModule::runOnce()
     if (rec_state == eRecEncoding) {
         // Encoder worker is running on its own task; just poll its done flag.
         if (encoder_done) {
-            pending_audio = std::move(encoder_result_audio);
+            const size_t produced = encoder_result_audio.size();
+            // Prefer SD for the "armed but not yet sent" window: flush the
+            // encoded bytes to /voicetastic_outbox.c2 and free the in-RAM
+            // copy. The user may let the captured message sit indefinitely
+            // before pressing send; keeping it on SD saves up to ~55 KB of
+            // resident PSRAM during that idle time.
+            pending_audio_on_sd = false;
+            pending_audio_size = 0;
+            pending_audio.clear();
+            pending_audio.shrink_to_fit();
+            if (produced > 0 && voicetastic::inbox::available()) {
+#if defined(HAS_SDCARD)
+                File f = voicetastic::inbox::outboxOpenWrite();
+                if (f) {
+                    concurrency::LockGuard spi_g(spiLock);
+                    const size_t wrote = f.write(encoder_result_audio.data(), produced);
+                    f.close();
+                    if (wrote == produced) {
+                        pending_audio_on_sd = true;
+                        pending_audio_size  = produced;
+                    } else {
+                        LOG_WARN("Voicetastic: outbox short write %u/%u, falling back to RAM",
+                                 (unsigned)wrote, (unsigned)produced);
+                        voicetastic::inbox::outboxClear();
+                    }
+                }
+#endif
+            }
+            if (!pending_audio_on_sd) {
+                pending_audio = std::move(encoder_result_audio);
+                pending_audio_size = pending_audio.size();
+            }
             encoder_result_audio.clear();
             encoder_result_audio.shrink_to_fit();
             encoder_done = false;
             rec_state = eRecIdle;
-            LOG_INFO("Voicetastic: encoding done, %u bytes ready; ENTER to send",
-                     (unsigned)pending_audio.size());
+            LOG_INFO("Voicetastic: encoding done, %u bytes ready (%s); ENTER to send",
+                     (unsigned)pending_audio_size,
+                     pending_audio_on_sd ? "SD" : "RAM");
         }
         return 100;
     }

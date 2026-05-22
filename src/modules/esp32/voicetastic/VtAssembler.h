@@ -12,6 +12,16 @@
 namespace voicetastic {
 
 // One reassembled voice message, ready for playback or hand-off.
+//
+// Storage layout:
+//   - If `audio` is non-empty, the codec frame bytes live in RAM (PSRAM on
+//     T-Deck). This is the fallback when no SD card is mounted.
+//   - If `audio` is empty AND `audio_size > 0`, the bytes are persisted to
+//     /voicetastic_inbox/<message_id>.c2 on SD. The struct itself only
+//     carries metadata + size; the playback worker streams from SD on demand.
+//
+// audio_size is authoritative either way (it equals audio.size() in the RAM
+// case). vtEstimateDurationMs and the chat-screen mini-player use it.
 struct ReceivedVoiceMessage {
     NodeNum   from;
     NodeNum   to;                  // MeshPacket destination (broadcast or this node)
@@ -24,7 +34,8 @@ struct ReceivedVoiceMessage {
     uint8_t   recovered_via_fec;   // data shards reconstructed by RS
     uint32_t  completed_ms;
     bool      played = false;      // set by the module after at least one playback
-    std::vector<uint8_t> audio;    // reassembled codec frame bytes (no container)
+    size_t    audio_size = 0;      // total codec bytes; populated whether RAM or SD-backed
+    std::vector<uint8_t> audio;    // reassembled codec frame bytes; empty if SD-backed
 };
 
 // Per-(from, message_id) reassembly state machine. Implements the data-path

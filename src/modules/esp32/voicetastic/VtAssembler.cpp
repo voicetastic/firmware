@@ -2,6 +2,7 @@
 
 #if defined(ARCH_ESP32) && defined(HAS_VOICETASTIC) && !MESHTASTIC_EXCLUDE_VOICETASTIC
 
+#include "VtInbox.h"
 #include "configuration.h"
 #include "rs/rs.h"
 #include <string.h>
@@ -348,16 +349,37 @@ void VtAssembler::publish(AssemblyState &s)
 
     const size_t final_size = s.last_data_real_size ? s.last_data_real_size : s.chunk_size;
     const size_t total_len = (size_t)(s.total_data - 1) * s.chunk_size + final_size;
-    msg.audio.reserve(total_len);
-    for (uint8_t i = 0; i < s.total_data; i++) {
-        const std::vector<uint8_t> &shard = s.data_shards[i];
-        const size_t take = (i == s.total_data - 1) ? final_size : s.chunk_size;
-        msg.audio.insert(msg.audio.end(), shard.begin(), shard.begin() + take);
+    msg.audio_size = total_len;
+
+    // Prefer SD storage when available. Saves ~5 KB / message of PSRAM and
+    // keeps the pending_play_queue's permanent footprint to ~kMaxInbox metadata
+    // structs (~120 B each) instead of audio buffers. RAM fallback runs when
+    // no SD is mounted, or if the write fails partway.
+    bool stored_on_sd = false;
+    if (inbox::available()) {
+        const size_t wrote = inbox::store(msg.message_id, s.data_shards,
+                                          s.total_data, s.chunk_size, final_size);
+        if (wrote == total_len) {
+            stored_on_sd = true;
+            // msg.audio stays empty — playback worker streams from SD.
+        } else {
+            LOG_WARN("vtAssembler: inbox::store failed (wrote=%u expected=%u), keeping in RAM",
+                     (unsigned)wrote, (unsigned)total_len);
+        }
+    }
+    if (!stored_on_sd) {
+        msg.audio.reserve(total_len);
+        for (uint8_t i = 0; i < s.total_data; i++) {
+            const std::vector<uint8_t> &shard = s.data_shards[i];
+            const size_t take = (i == s.total_data - 1) ? final_size : s.chunk_size;
+            msg.audio.insert(msg.audio.end(), shard.begin(), shard.begin() + take);
+        }
     }
     msg.recovered_via_fec = (uint8_t)(s.total_data - msg.received_data);
 
-    LOG_INFO("vtAssembler: mid=%08x complete (%u bytes, %u/%u direct + %u FEC)",
-             (unsigned)msg.message_id, (unsigned)msg.audio.size(),
+    LOG_INFO("vtAssembler: mid=%08x complete (%u bytes %s, %u/%u direct + %u FEC)",
+             (unsigned)msg.message_id, (unsigned)msg.audio_size,
+             stored_on_sd ? "on SD" : "in RAM",
              (unsigned)msg.received_data, (unsigned)msg.total_data,
              (unsigned)msg.recovered_via_fec);
 
