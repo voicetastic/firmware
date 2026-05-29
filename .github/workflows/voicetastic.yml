@@ -189,20 +189,34 @@ jobs:
           retention-days: 14
 
   # -----------------------------------------------------------------
-  # release-and-publish — auto-bump semver from conventional commits
-  # on pushes to voicetastic-firmware, then publish a GitHub Release
-  # with the firmware artifact built upstream of this job.
+  # release-and-publish — publish a GitHub Release with the firmware
+  # artifact built upstream of this job. Two entry points:
   #
-  # Two-step-into-one because GitHub's default GITHUB_TOKEN cannot
-  # trigger another workflow when it pushes a tag (loop guard), so a
-  # separate "publish-on-tag" workflow would simply never fire. We do
-  # both in the same run instead.
+  #   (1) Branch push to voicetastic-firmware: compute a semver bump
+  #       from conventional commits since the last v* tag, push the
+  #       new tag, then publish.
+  #   (2) Tag push of v*: use the pushed tag verbatim, skip the bump
+  #       + tag steps, then publish. Lets you manually pick a version
+  #       (hotfix, pre-release, fresh namespace) without needing a
+  #       conventional-commit on HEAD.
+  #
+  # Both end at the same Create GitHub Release step.
+  #
+  # Note: (1) uses GITHUB_TOKEN to push the new tag, and the GH loop
+  # guard prevents that tag-push from re-triggering this workflow on
+  # the tag — so we never duplicate publish from the auto-bump path.
+  # (2) only fires for tags pushed from outside the workflow (SSH,
+  # PAT, etc.).
   # -----------------------------------------------------------------
   release-and-publish:
     name: Tag + publish release
     runs-on: ubuntu-latest
     needs: build-firmware
-    if: github.event_name == 'push' && github.ref == 'refs/heads/voicetastic-firmware'
+    if: |
+      github.event_name == 'push' && (
+        github.ref == 'refs/heads/voicetastic-firmware' ||
+        startsWith(github.ref, 'refs/tags/v')
+      )
     permissions:
       # Push tag + create GitHub Release with binary assets.
       contents: write
@@ -217,8 +231,9 @@ jobs:
           name: voicetastic-firmware-tdeck-${{ github.sha }}
           path: artifacts/
 
-      - name: Compute semver bump
+      - name: Compute semver bump (branch-push path only)
         id: bump
+        if: github.ref == 'refs/heads/voicetastic-firmware'
         run: |
           set -eu
           git config user.email "ci@github.com"
@@ -262,19 +277,43 @@ jobs:
             echo "prev=$LAST"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Push tag
-        if: steps.bump.outputs.tag != ''
+      - name: Push tag (branch-push path only)
+        if: github.ref == 'refs/heads/voicetastic-firmware' && steps.bump.outputs.tag != ''
         run: |
           git tag -a "${{ steps.bump.outputs.tag }}" \
             -m "Release ${{ steps.bump.outputs.tag }} (auto, ${{ steps.bump.outputs.bump }} bump from ${{ steps.bump.outputs.prev }})"
           git push origin "${{ steps.bump.outputs.tag }}"
 
+      # Reconcile the two entry points: figure out which tag to publish
+      # (and which previous tag drives the changelog range).
+      # Output is empty when there's nothing to publish (e.g. branch
+      # push with no releasable commits) — every step below `if`s on it.
+      - name: Resolve release tag
+        id: tag
+        run: |
+          set -eu
+          git fetch --tags --quiet
+          if [ "${{ github.ref }}" = "refs/heads/voicetastic-firmware" ]; then
+            NAME="${{ steps.bump.outputs.tag }}"
+            PREV="${{ steps.bump.outputs.prev }}"
+          else
+            NAME="${GITHUB_REF_NAME}"
+            PREV=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname \
+                   | grep -v "^${NAME}\$" | head -n1 || true)
+            PREV=${PREV:-v0.0.0}
+          fi
+          echo "Effective: tag=$NAME prev=$PREV"
+          {
+            echo "name=$NAME"
+            echo "prev=$PREV"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Generate release notes
-        if: steps.bump.outputs.tag != ''
+        if: steps.tag.outputs.name != ''
         id: notes
         env:
-          TAG: ${{ steps.bump.outputs.tag }}
-          PREV: ${{ steps.bump.outputs.prev }}
+          TAG: ${{ steps.tag.outputs.name }}
+          PREV: ${{ steps.tag.outputs.prev }}
         run: |
           set -eu
           # PREV is "v0.0.0" if this is the first release; treat that as
@@ -319,11 +358,11 @@ jobs:
           cat release-notes.md
 
       - name: Create GitHub Release
-        if: steps.bump.outputs.tag != ''
+        if: steps.tag.outputs.name != ''
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.bump.outputs.tag }}
-          name: Voicetastic Firmware ${{ steps.bump.outputs.tag }}
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: Voicetastic Firmware ${{ steps.tag.outputs.name }}
           body_path: release-notes.md
           files: |
             artifacts/voicetastic-tdeck.bin
