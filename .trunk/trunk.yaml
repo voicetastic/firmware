@@ -14,7 +14,7 @@ lint:
     - trufflehog@3.90.13
     - yamllint@1.37.1
     - bandit@1.8.6
-    - trivy@0.67.2
+    - trivy@0.70.0
     - taplo@0.10.0
     - ruff@0.14.4
     - isort@7.0.0
