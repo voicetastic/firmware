@@ -1,0 +1,331 @@
+# Voicetastic firmware CI/CD (translated from .gitlab-ci.yml on the
+# ci/setup-pipeline branch).
+#
+# Single build target: `t-deck-tft`. This is the env that compiles in
+# the device-ui LVGL GUI (HAS_TFT=1, VIEW_320x240,
+# ${device-ui_base.lib_deps}). One artifact serves both the LilyGo
+# T-Deck and the T-Deck Plus: same ESP32-S3 + same 320x240 screen,
+# the Plus just adds GPS/battery.
+#
+# Pipeline shape:
+#
+#   test-native ─▶ build-firmware ─▶ release-and-publish
+#                                    (on voicetastic-firmware pushes
+#                                     when conventional commits warrant
+#                                     a bump; consumes the artifact
+#                                     from build-firmware via the
+#                                     same workflow run)
+#
+# device-ui dependency
+# --------------------
+# `platformio.ini` consumes device-ui via
+# `symlink://../meshtastic-device-ui`, so device-ui has to live as a
+# sibling of the firmware checkout. We clone it via raw `git` (not
+# `actions/checkout`) because `actions/checkout`'s `path:` is sandboxed
+# inside $GITHUB_WORKSPACE and cannot point at a sibling directory.
+
+name: Voicetastic CI
+
+on:
+  push:
+    branches: ['voicetastic-firmware']
+    tags: ['v*']
+  pull_request:
+    branches: ['voicetastic-firmware']
+  workflow_dispatch:
+
+# Cancel duplicate runs only on pull-requests. Branch / tag pushes
+# always finish (the release job needs the firmware artifact built by
+# its parent run).
+concurrency:
+  group: voicetastic-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # device-ui ref consumed via the sibling symlink. To make firmware
+  # builds reproducible later, point this at a device-ui tag instead.
+  DEVICE_UI_REPO: voicetastic/device-ui
+  DEVICE_UI_BRANCH: voicetastic-integration
+
+jobs:
+  # -----------------------------------------------------------------
+  # test-native — pure-logic unit tests (crypto, meshpacket
+  # serializers, MQTT, serial). Mirrors upstream's
+  # `.github/workflows/test_native.yml` `platformio-tests` job: the
+  # `coverage` env (not bare `native`) is the one that adds
+  # `test_testing_command = ${...}/program -s`, so the simulator
+  # exits instead of daemonising under SIGHUP and ERROR-ing every
+  # suite.
+  # -----------------------------------------------------------------
+  test-native:
+    name: Native unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            pkg-config cmake build-essential \
+            libbluetooth-dev libgpiod-dev libyaml-cpp-dev libssl-dev \
+            libulfius-dev liborcania-dev libusb-1.0-0-dev libi2c-dev libuv1-dev
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache PlatformIO (native)
+        uses: actions/cache@v4
+        with:
+          # PlatformIO honours $PLATFORMIO_CORE_DIR; default lives in
+          # $HOME, so we use the repo-relative path to keep the cache
+          # key + path aligned with the GitLab job.
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: native-${{ hashFiles('platformio.ini', 'variants/native/portduino/platformio.ini') }}
+          restore-keys: |
+            native-
+
+      - name: Install PlatformIO
+        run: pip install --quiet --upgrade platformio
+
+      - name: Run native tests
+        run: pio test -e coverage -v --junit-output-path testreport.xml
+
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-report
+          path: testreport.xml
+          retention-days: 7
+
+  # -----------------------------------------------------------------
+  # build-firmware — compile the t-deck-tft env on every push / PR
+  # (and on tag pushes too, where release-and-publish needs the
+  # artifact in this same workflow run).
+  # -----------------------------------------------------------------
+  build-firmware:
+    name: Build t-deck-tft
+    runs-on: ubuntu-latest
+    needs: test-native
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # Full history so release-and-publish can compute the
+          # previous tag for the changelog without re-checkout.
+          fetch-depth: 0
+
+      - name: Clone device-ui as sibling
+        run: |
+          # platformio.ini resolves `symlink://../meshtastic-device-ui`
+          # relative to itself, so the target must be a sibling of
+          # $GITHUB_WORKSPACE. actions/checkout sandboxes `path:` inside
+          # the workspace, so we shell out instead.
+          DEVICE_UI_DIR="$(dirname "$GITHUB_WORKSPACE")/meshtastic-device-ui"
+          if [ ! -d "$DEVICE_UI_DIR" ]; then
+            git clone --depth 1 --branch "$DEVICE_UI_BRANCH" \
+              "https://github.com/$DEVICE_UI_REPO.git" "$DEVICE_UI_DIR"
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential
+
+      - name: Cache PlatformIO (t-deck-tft)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          # t-deck-tft extends env:t-deck so its deps flow from the
+          # t-deck variant ini, plus the top-level platformio.ini that
+          # owns [device-ui_base].
+          key: tdeck-${{ hashFiles('platformio.ini', 'variants/esp32s3/t-deck/platformio.ini') }}
+          restore-keys: |
+            tdeck-
+
+      - name: Install PlatformIO
+        run: pip install --quiet --upgrade platformio
+
+      - name: Build
+        run: pio run -e t-deck-tft
+
+      - name: Stage artifacts
+        run: |
+          set -eu
+          mkdir -p artifacts
+          # firmware.bin = OTA / app image
+          # firmware.factory.bin = bootloader + partitions + app
+          #   (factory image for a fresh board / browser flashing).
+          # The factory image is produced by meshtastic's custom
+          # post-build script; guard the copy in case a config doesn't
+          # emit it.
+          cp ".pio/build/t-deck-tft/firmware.bin" "artifacts/voicetastic-tdeck.bin"
+          if [ -f ".pio/build/t-deck-tft/firmware.factory.bin" ]; then
+            cp ".pio/build/t-deck-tft/firmware.factory.bin" "artifacts/voicetastic-tdeck-factory.bin"
+          else
+            echo "::warning::no firmware.factory.bin produced; only the OTA image will ship."
+          fi
+          ls -lh artifacts/
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: voicetastic-firmware-tdeck-${{ github.sha }}
+          path: artifacts/
+          retention-days: 14
+
+  # -----------------------------------------------------------------
+  # release-and-publish — auto-bump semver from conventional commits
+  # on pushes to voicetastic-firmware, then publish a GitHub Release
+  # with the firmware artifact built upstream of this job.
+  #
+  # Two-step-into-one because GitHub's default GITHUB_TOKEN cannot
+  # trigger another workflow when it pushes a tag (loop guard), so a
+  # separate "publish-on-tag" workflow would simply never fire. We do
+  # both in the same run instead.
+  # -----------------------------------------------------------------
+  release-and-publish:
+    name: Tag + publish release
+    runs-on: ubuntu-latest
+    needs: build-firmware
+    if: github.event_name == 'push' && github.ref == 'refs/heads/voicetastic-firmware'
+    permissions:
+      # Push tag + create GitHub Release with binary assets.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download firmware artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: voicetastic-firmware-tdeck-${{ github.sha }}
+          path: artifacts/
+
+      - name: Compute semver bump
+        id: bump
+        run: |
+          set -eu
+          git config user.email "ci@github.com"
+          git config user.name "Voicetastic Release Bot"
+          git fetch --tags --quiet
+
+          LAST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+          LAST=${LAST:-v0.0.0}
+          VER=${LAST#v}
+          MAJ=$(echo "$VER" | cut -d. -f1)
+          MIN=$(echo "$VER" | cut -d. -f2)
+          PAT=$(echo "$VER" | cut -d. -f3)
+
+          if [ "$LAST" = "v0.0.0" ]; then RANGE="HEAD"; else RANGE="${LAST}..HEAD"; fi
+          MSGS=$(git log "$RANGE" --pretty=format:'%s%n%b%n---END---')
+          BUMP=none
+          if echo "$MSGS" | grep -qE '^[a-z]+(\([^)]+\))?!:|^BREAKING CHANGE:'; then
+            BUMP=major
+          elif echo "$MSGS" | grep -qE '^feat(\([^)]+\))?:'; then
+            BUMP=minor
+          elif echo "$MSGS" | grep -qE '^fix(\([^)]+\))?:'; then
+            BUMP=patch
+          fi
+
+          if [ "$BUMP" = none ]; then
+            echo "No releasable commits since $LAST. Skipping release."
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          case "$BUMP" in
+            major) MAJ=$((MAJ+1)); MIN=0; PAT=0 ;;
+            minor) MIN=$((MIN+1)); PAT=0 ;;
+            patch) PAT=$((PAT+1)) ;;
+          esac
+          NEW="v${MAJ}.${MIN}.${PAT}"
+          echo "Bump $BUMP: $LAST -> $NEW"
+          {
+            echo "tag=$NEW"
+            echo "bump=$BUMP"
+            echo "prev=$LAST"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Push tag
+        if: steps.bump.outputs.tag != ''
+        run: |
+          git tag -a "${{ steps.bump.outputs.tag }}" \
+            -m "Release ${{ steps.bump.outputs.tag }} (auto, ${{ steps.bump.outputs.bump }} bump from ${{ steps.bump.outputs.prev }})"
+          git push origin "${{ steps.bump.outputs.tag }}"
+
+      - name: Generate release notes
+        if: steps.bump.outputs.tag != ''
+        id: notes
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
+          PREV: ${{ steps.bump.outputs.prev }}
+        run: |
+          set -eu
+          # PREV is "v0.0.0" if this is the first release; treat that as
+          # "no previous tag" for range purposes.
+          if [ "$PREV" = "v0.0.0" ] || [ -z "$PREV" ]; then
+            RANGE="HEAD"
+            PREV=""
+          else
+            RANGE="${PREV}..HEAD"
+          fi
+
+          section() {
+            title=$1; pat=$2
+            lines=$(git log "$RANGE" --no-merges --pretty=format:'%h %s' | grep -E "$pat" || true)
+            [ -z "$lines" ] && return 0
+            printf '\n### %s\n\n' "$title"
+            echo "$lines" | sed 's/^/- /'
+          }
+
+          {
+            if [ -n "$PREV" ]; then
+              echo "Changes since [\`$PREV\`](https://github.com/${GITHUB_REPOSITORY}/releases/tag/$PREV)."
+            else
+              echo "First release."
+            fi
+            echo ""
+            echo "**Target**: T-Deck / T-Deck Plus (\`t-deck-tft\`, device-ui GUI)."
+            echo "**Device UI**: \`${DEVICE_UI_BRANCH}\` branch of voicetastic/device-ui."
+            echo ""
+            echo "Flash \`voicetastic-tdeck-factory.bin\` to a fresh board;"
+            echo "\`voicetastic-tdeck.bin\` is the OTA / update image."
+            section "Breaking changes" '^[a-z]+(\([^)]+\))?!:'
+            section "Features"         '^feat(\([^)]+\))?:'
+            section "Fixes"            '^fix(\([^)]+\))?:'
+            section "Performance"      '^perf(\([^)]+\))?:'
+            section "Refactoring"      '^refactor(\([^)]+\))?:'
+            if [ -n "$PREV" ]; then
+              printf '\n**Full diff:** https://github.com/%s/compare/%s...%s\n' "$GITHUB_REPOSITORY" "$PREV" "$TAG"
+            fi
+          } > release-notes.md
+          echo '--- release-notes.md ---'
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        if: steps.bump.outputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.bump.outputs.tag }}
+          name: Voicetastic Firmware ${{ steps.bump.outputs.tag }}
+          body_path: release-notes.md
+          files: |
+            artifacts/voicetastic-tdeck.bin
+            artifacts/voicetastic-tdeck-factory.bin
+          fail_on_unmatched_files: false
