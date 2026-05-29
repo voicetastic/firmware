@@ -224,6 +224,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # On tag-triggered runs, actions/checkout doesn't pull tags by
+          # default; our scripts need the full v* tag list for the
+          # changelog range, so request them at checkout time. Defensive
+          # `|| true` on the in-script fetch calls below catches any
+          # remaining edge case.
+          fetch-tags: true
 
       - name: Download firmware artifact
         uses: actions/download-artifact@v4
@@ -238,7 +244,7 @@ jobs:
           set -eu
           git config user.email "ci@github.com"
           git config user.name "Voicetastic Release Bot"
-          git fetch --tags --quiet
+          git fetch --tags --quiet || true
 
           LAST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
           LAST=${LAST:-v0.0.0}
@@ -292,7 +298,7 @@ jobs:
         id: tag
         run: |
           set -eu
-          git fetch --tags --quiet
+          git fetch --tags --quiet || true
           if [ "${{ github.ref }}" = "refs/heads/voicetastic-firmware" ]; then
             NAME="${{ steps.bump.outputs.tag }}"
             PREV="${{ steps.bump.outputs.prev }}"
