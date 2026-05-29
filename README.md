@@ -21,6 +21,26 @@
 	<a href="https://meshtastic.org/docs/">Documentation</a>
 </div>
 
+> [!IMPORTANT]
+> **Voicetastic firmware fork**
+>
+> This is the [Voicetastic](https://github.com/voicetastic) build of
+> Meshtastic firmware, with native support for asynchronous voice
+> messages over LoRa.
+>
+> **An SD card is required.** Voicetastic uses the SD card as the
+> working buffer for **assembling outgoing voice clips and reassembling
+> incoming ones**. Boards without an SD slot, or with an empty slot,
+> cannot send or receive voice; the rest of the firmware still works as
+> stock Meshtastic.
+>
+> **Recording a voice message on a device with a keyboard (e.g. T-Deck):**
+>
+> 1. Press `Shift` + `mic` to start recording.
+> 2. Press `Shift` + `mic` again to stop.
+> 3. Press `Enter` to send the clip on the currently selected channel
+>    or DM thread.
+
 ## Overview
 
 This repository contains the official device firmware for Meshtastic, an open-source LoRa mesh networking project designed for long-range, low-power communication without relying on internet or cellular infrastructure. The firmware supports various hardware platforms, including ESP32, nRF52, RP2040/RP2350, and Linux-based devices.
