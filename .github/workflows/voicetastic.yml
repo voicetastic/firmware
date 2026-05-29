@@ -28,10 +28,10 @@ name: Voicetastic CI
 
 on:
   push:
-    branches: ['voicetastic-firmware']
-    tags: ['v*']
+    branches: [voicetastic-firmware]
+    tags: [v*]
   pull_request:
-    branches: ['voicetastic-firmware']
+    branches: [voicetastic-firmware]
   workflow_dispatch:
 
 # Cancel duplicate runs only on pull-requests. Branch / tag pushes
@@ -76,7 +76,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Cache PlatformIO (native)
         uses: actions/cache@v4
@@ -137,7 +137,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Install build deps
         run: |
