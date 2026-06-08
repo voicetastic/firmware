@@ -371,7 +371,26 @@ void PositionModule::sendOurPosition(NodeNum dest, bool wantReplies, uint8_t cha
     if (channel > 0)
         p->channel = channel;
 
-    service->sendToMesh(p, RX_SRC_LOCAL, true);
+    // The mesh must only ever see the precision-masked position (the
+    // position_precision privacy feature), so do NOT carbon-copy it to the
+    // phone here.
+    service->sendToMesh(p, RX_SRC_LOCAL, false);
+
+    // Our own phone / on-device UI should display our TRUE position, not the
+    // masked broadcast. Send a separate full-precision copy to the local
+    // client only (never transmitted over the mesh). precision == 32 keeps
+    // allocPositionPacket from skipping (0) or truncating (< 32) lat/lon.
+    {
+        uint32_t maskedPrecision = precision;
+        precision = 32;
+        meshtastic_MeshPacket *phoneCopy = allocPositionPacket();
+        precision = maskedPrecision;
+        if (phoneCopy) {
+            phoneCopy->from = nodeDB->getNodeNum();
+            phoneCopy->to = dest;
+            service->sendToPhone(phoneCopy);
+        }
+    }
 
     if (IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_TRACKER,
                   meshtastic_Config_DeviceConfig_Role_TAK_TRACKER) &&

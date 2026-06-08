@@ -1,0 +1,1310 @@
+#include "VoicetasticModule.h"
+
+#if defined(ARCH_ESP32) && defined(HAS_VOICETASTIC) && !MESHTASTIC_EXCLUDE_VOICETASTIC
+
+#include "MeshService.h"
+#include "NodeDB.h"
+#include "RadioInterface.h"
+#include "Router.h"
+#include "SPILock.h"
+#include "VtAudio.h"
+#include "VtInbox.h"
+#include "VtProtocol.h"
+#include "concurrency/LockGuard.h"
+#include "memGet.h"
+#include "rs/rs.h"
+#include <Arduino.h>
+#include <Preferences.h>
+#include <esp_random.h>
+#include <string.h>
+
+// NVS namespace + key for the persisted Codec2 encode mode. Namespace must be
+// ≤ 15 chars and key ≤ 15 chars (ESP-IDF NVS limit).
+static constexpr const char *VT_NVS_NAMESPACE = "voicetastic";
+static constexpr const char *VT_NVS_KEY_C2MODE = "c2mode";
+static constexpr const char *VT_NVS_KEY_STREAMSEQ = "streamseq";
+
+// stream_seq block-reservation size. At boot we read the previously persisted
+// "next safe sequence" from NVS and immediately write that value + BLOCK ahead,
+// reserving the BLOCK values [stored .. stored+BLOCK) for this boot's use. We
+// then hand them out without touching NVS. Only when the in-RAM counter
+// crosses the reserved block do we commit the next reservation.
+//
+// Trade-off: every boot consumes one block of stream_seq values regardless of
+// whether they're used, so a device that reboots heavily without sending will
+// cycle through the 8-bit sequence space faster. With BLOCK=16, a power loss
+// in mid-block can replay at most BLOCK-1 sequence values from the previous
+// session's tail — but those values are uint8_t and only need to be distinct
+// from values currently in flight (8-second linger window). Wrap-around
+// collision is the cost of cutting 16x worth of flash writes per message.
+static constexpr uint8_t VT_STREAMSEQ_BLOCK = 16;
+
+VoicetasticModule *voicetasticModule;
+
+// Round-trip a known header through the codec at boot so any wire-format
+// regression shows up immediately in the serial log. Cheap; runs once.
+static void runProtocolSelfTest()
+{
+    using namespace voicetastic;
+    VtHeader h{};
+    h.version        = PROTOCOL_VERSION;
+    h.packet_type    = PacketType::DATA;
+    h.last_in_stream = false;
+    h.message_id     = 0xDEADBEEF;
+    h.codec          = CodecId::CODEC2;
+    h.codec_param    = (uint8_t)Codec2Mode::M_1200; // self-test only; any valid mode is fine
+    h.stream_seq     = 7;
+    h.chunk_index    = 3;
+    h.total_data     = 22;
+    h.parity_count   = 5;
+
+    uint8_t buf[HEADER_SIZE] = {0};
+    if (encodeHeader(h, buf) != HEADER_SIZE) {
+        LOG_ERROR("Voicetastic selftest: encodeHeader failed");
+        return;
+    }
+
+    VtHeader r{};
+    if (!decodeHeader(buf, r)) {
+        LOG_ERROR("Voicetastic selftest: decodeHeader rejected our own output");
+        return;
+    }
+
+    const bool ok =
+        r.version == h.version && r.packet_type == h.packet_type &&
+        r.last_in_stream == h.last_in_stream && r.message_id == h.message_id && r.codec == h.codec &&
+        r.codec_param == h.codec_param && r.stream_seq == h.stream_seq && r.chunk_index == h.chunk_index &&
+        r.total_data == h.total_data && r.parity_count == h.parity_count;
+
+    if (ok) {
+        LOG_INFO("Voicetastic selftest: header codec OK (mid=%08x)", (unsigned)r.message_id);
+    } else {
+        LOG_ERROR("Voicetastic selftest: round-trip mismatch");
+    }
+}
+
+VoicetasticModule::VoicetasticModule()
+    : SinglePortModule("Voicetastic", meshtastic_PortNum_PRIVATE_APP), concurrency::OSThread("Voicetastic")
+{
+    LOG_INFO("Voicetastic module init (port=%d, scope=TX+RX Codec2 plaintext+FEC)", (int)meshtastic_PortNum_PRIVATE_APP);
+    // The build-time #error in VoicetasticModule.h enforces BOARD_HAS_PSRAM,
+    // but a board could declare PSRAM and then fail to detect it at runtime
+    // (bad chip, bad SPI lines, wrong frequency). Surface that here as a hard
+    // disable so we don't spin trying to malloc 76 KB-class shard buffers into
+    // a 327 KB DRAM heap and OOM the rest of the firmware.
+    if (memGet.getPsramSize() == 0) {
+        LOG_ERROR("Voicetastic: BOARD_HAS_PSRAM declared but no PSRAM detected at runtime — "
+                  "shard/audio buffers would compete with TFT/LVGL in DRAM. Module disabled.");
+        psram_missing = true;
+        // Carry on with module construction so the OSThread plumbing is sane
+        // — but every public entry point short-circuits while psram_missing is
+        // set. The module is harmless dead weight in that state.
+        return;
+    }
+    // Restore the user-selected Codec2 mode and stream_seq base from NVS,
+    // then reserve a fresh block of sequence values for this boot. Two NVS
+    // ops total (one read, one write) per boot instead of one write per
+    // message — sequence values [stored .. stored+BLOCK) are now spendable
+    // without further flash writes.
+    {
+        Preferences prefs;
+        if (prefs.begin(VT_NVS_NAMESPACE, /*readOnly=*/false)) {
+            const uint8_t fallback = (uint8_t)codec2_mode;
+            const uint8_t stored_mode = prefs.getUChar(VT_NVS_KEY_C2MODE, fallback);
+            const uint8_t stored_seq  = prefs.getUChar(VT_NVS_KEY_STREAMSEQ, 0);
+            stream_seq_counter = stored_seq;
+            // Reserve [stored_seq, stored_seq + BLOCK) — uint8_t wrap is fine
+            // (we only ever compare counter == reserved_end). Commit the new
+            // reservation boundary to NVS now so a reboot mid-block resumes
+            // from the next block, avoiding collision with this block's tail.
+            stream_seq_reserved_end = (uint8_t)(stored_seq + VT_STREAMSEQ_BLOCK);
+            prefs.putUChar(VT_NVS_KEY_STREAMSEQ, stream_seq_reserved_end);
+            prefs.end();
+            // Clamp to the valid enum range (M_3200..M_1200 = 0..5).
+            if (stored_mode <= (uint8_t)voicetastic::Codec2Mode::M_1200) {
+                codec2_mode = (voicetastic::Codec2Mode)stored_mode;
+                LOG_INFO("Voicetastic: codec2 mode restored from NVS = %u", (unsigned)stored_mode);
+            }
+            LOG_INFO("Voicetastic: stream_seq resumed from NVS = %u, reserved block ending at %u",
+                     (unsigned)stream_seq_counter, (unsigned)stream_seq_reserved_end);
+        }
+    }
+    runProtocolSelfTest();
+    voicetastic::rs::runSelfTest();
+    boot_ms = millis();
+
+    // Initialise the SD-backed inbox if HAS_SDCARD and a card is actually
+    // mounted. Wipes any stale audio files from a previous session — we
+    // don't yet persist mini-player state across reboots. If SD is absent,
+    // received messages will fall back to RAM via ReceivedVoiceMessage::audio.
+    if (voicetastic::inbox::init()) {
+        voicetastic::inbox::clearAll();
+    }
+
+    // Bring the ES7210 chip up *once*, here, so the only I2C traffic to the
+    // codec at runtime is the I2S-only swap during playback handoff. Doing
+    // this lazily on first record would replay the chip-init I2C sequence
+    // while the TFT keyboard scanner is already polling the same bus, which
+    // we've observed to be racy on hardware. After this, startRecording()
+    // and the post-playback flow only touch the I2S driver, never the chip
+    // over I2C.
+    if (!voicetastic::VtAudio::initMic()) {
+        LOG_ERROR("Voicetastic: boot mic init failed; record/playback disabled until reboot");
+    }
+}
+
+void VoicetasticModule::setCodec2Mode(voicetastic::Codec2Mode mode)
+{
+    concurrency::LockGuard g(&state_lock_);
+    codec2_mode = mode;
+    Preferences prefs;
+    if (prefs.begin(VT_NVS_NAMESPACE, /*readOnly=*/false)) {
+        prefs.putUChar(VT_NVS_KEY_C2MODE, (uint8_t)mode);
+        prefs.end();
+        LOG_INFO("Voicetastic: codec2 mode persisted = %u", (unsigned)mode);
+    } else {
+        LOG_WARN("Voicetastic: NVS open failed; codec2 mode not persisted");
+    }
+}
+
+bool VoicetasticModule::enqueueOutbound(const uint8_t *audio, size_t audio_len,
+                                        voicetastic::CodecId codec, uint8_t codec_param,
+                                        NodeNum to, uint8_t channel)
+{
+    if (psram_missing) return false;
+    concurrency::LockGuard g(&state_lock_);
+    return enqueueOutboundLocked(audio, audio_len, codec, codec_param, to, channel);
+}
+
+bool VoicetasticModule::enqueueOutboundLocked(const uint8_t *audio, size_t audio_len,
+                                              voicetastic::CodecId codec, uint8_t codec_param,
+                                              NodeNum to, uint8_t channel)
+{
+    using namespace voicetastic;
+    if (tx_active) {
+        LOG_WARN("Voicetastic: TX busy, drop enqueue");
+        return false;
+    }
+    const auto preset = (meshtastic_Config_LoRaConfig_ModemPreset)config.lora.modem_preset;
+    const uint32_t mid = esp_random() | 1u; // non-zero u32 per spec §6
+    const uint8_t  seq = stream_seq_counter++;
+    // The constructor pre-reserved a block of VT_STREAMSEQ_BLOCK sequence
+    // values for this boot, so most enqueues just bump the counter without
+    // touching flash. Only when the counter hits the reservation boundary do
+    // we extend the reservation and commit a new boundary to NVS — one write
+    // per 16 messages instead of one per message. Power loss inside the
+    // current block can only replay this block's tail, never collide with a
+    // future boot (the boundary was committed up front in the constructor).
+    if (stream_seq_counter == stream_seq_reserved_end) {
+        stream_seq_reserved_end = (uint8_t)(stream_seq_reserved_end + VT_STREAMSEQ_BLOCK);
+        Preferences prefs;
+        if (prefs.begin(VT_NVS_NAMESPACE, /*readOnly=*/false)) {
+            prefs.putUChar(VT_NVS_KEY_STREAMSEQ, stream_seq_reserved_end);
+            prefs.end();
+            LOG_DEBUG("Voicetastic: stream_seq block exhausted, reserved next block ending at %u",
+                      (unsigned)stream_seq_reserved_end);
+        }
+    }
+
+    if (!buildOutbound(audio, audio_len, preset, codec, codec_param, mid, seq, tx_msg)) {
+        LOG_ERROR("Voicetastic: buildOutbound failed (audio_len=%u preset=%d)",
+                  (unsigned)audio_len, (int)preset);
+        return false;
+    }
+
+    tx_to = to;
+    tx_channel = channel;
+    retransmitClear();
+    tx_linger_until_ms = 0;
+    tx_next_chunk = 0;
+    tx_paced_until_ms = 0;
+    tx_active = true;
+    LOG_INFO("Voicetastic: enqueue mid=%08x total_data=%u parity=%u chunk=%u last_real=%u",
+             (unsigned)tx_msg.message_id, (unsigned)tx_msg.total_data,
+             (unsigned)tx_msg.parity_count, (unsigned)tx_msg.chunk_size,
+             (unsigned)tx_msg.last_data_real_size);
+    return true;
+}
+
+// Fixed PCM frame size used for on-disk buffering: 320 samples (40 ms at
+// 8 kHz) per frame, 2 bytes/sample = 640 bytes per frame. Matches Codec2's
+// samples_per_frame so the encoding loop reads exactly one frame at a time.
+static constexpr int VT_PCM_SAMPLES_PER_FRAME = 320;
+static constexpr size_t VT_PCM_BYTES_PER_FRAME = VT_PCM_SAMPLES_PER_FRAME * sizeof(int16_t);
+static constexpr const char *VT_PCM_PATH = "/voicetastic.pcm";
+
+// Forward-declare the codec2 frame-info helper used by the duration cap below.
+// (Definition appears later in this file alongside vtEstimateDurationMs.)
+static void vtCodec2FrameInfo(voicetastic::Codec2Mode mode, int &bytes_per_frame,
+                              int &samples_per_frame);
+
+// Maximum recording duration (ms) given the active modem preset and codec2
+// mode. Derived from the protocol cap `maxAudioBytes(chunk_size) = chunk_size *
+// 255` (spec §4) divided by the codec's byte rate. Mirroring the post-encode
+// check inside buildOutbound here lets startRecording fast-fail instead of
+// burning seconds capturing PCM and then rejecting at send time.
+static uint32_t vtMaxRecordingMs(meshtastic_Config_LoRaConfig_ModemPreset preset,
+                                 voicetastic::Codec2Mode mode)
+{
+    using namespace voicetastic;
+    const size_t max_bytes = maxAudioBytes(chunkSizeForPreset(preset));
+    int bpf = 6, spf = 320;
+    vtCodec2FrameInfo(mode, bpf, spf);
+    if (bpf <= 0 || spf <= 0) return 0;
+    // bytes_per_sec = bpf * 8000 / spf. Convert max_bytes -> milliseconds:
+    //   ms = max_bytes * 1000 / bytes_per_sec
+    //      = max_bytes * spf / (bpf * 8)
+    const uint64_t ms = (uint64_t)max_bytes * (uint64_t)spf / ((uint64_t)bpf * 8u);
+    if (ms > 0xFFFFFFFFu) return 0xFFFFFFFFu;
+    return (uint32_t)ms;
+}
+
+// We buffer PCM in LittleFS (the firmware's internal filesystem, mounted at
+// boot via FSCom). Guard returns true as long as FSCom has at least *some*
+// addressable space — i.e. the FS is mounted. If LittleFS failed to mount
+// (rare, would log "FS mount failed" earlier in boot), recording is a no-op.
+static bool vtStorageAvailable()
+{
+    return FSCom.totalBytes() > 0;
+}
+
+bool VoicetasticModule::startRecording(uint32_t duration_ms, NodeNum to)
+{
+    if (psram_missing) return false;
+    concurrency::LockGuard g(&state_lock_);
+    using namespace voicetastic;
+    (void)to; // Destination is decided at sendPending() time.
+    if (rec_state != eRecIdle) { LOG_WARN("Voicetastic: already recording/encoding"); return false; }
+    if (tx_active) { LOG_WARN("Voicetastic: TX in progress; cannot record yet"); return false; }
+    if (duration_ms == 0) { LOG_WARN("Voicetastic: zero-duration recording rejected"); return false; }
+
+    // Reject up front anything that wouldn't survive the post-encode check in
+    // buildOutbound. The max is preset+mode dependent; computing it here keeps
+    // the UI honest without spending seconds capturing PCM that buildOutbound
+    // would then refuse. The post-encode check still acts as a backstop in
+    // case the modem preset or codec mode changes mid-recording.
+    const auto preset = (meshtastic_Config_LoRaConfig_ModemPreset)config.lora.modem_preset;
+    const uint32_t max_ms = vtMaxRecordingMs(preset, codec2_mode);
+    if (max_ms > 0 && duration_ms > max_ms) {
+        LOG_WARN("Voicetastic: requested duration %u ms exceeds max %u ms for preset=%d codec2=%u",
+                 (unsigned)duration_ms, (unsigned)max_ms, (int)preset, (unsigned)codec2_mode);
+        return false;
+    }
+
+    // Guard: voice recording needs an SD card mounted (we buffer raw PCM there
+    // to keep codec2_encode out of the loop task during capture). Without one,
+    // SYM+0 is silently a no-op.
+    if (!vtStorageAvailable()) {
+        LOG_WARN("Voicetastic: FSCom storage not mounted; recording disabled");
+        return false;
+    }
+
+    if (!pending_audio.empty() || pending_audio_on_sd) {
+        // discardPending() takes the lock — we're already holding it, so
+        // inline the cleanup instead. (state_lock_ is non-recursive.)
+        pending_audio.clear();
+        pending_audio.shrink_to_fit();
+        if (pending_audio_on_sd) {
+            voicetastic::inbox::outboxClear();
+            pending_audio_on_sd = false;
+        }
+        pending_audio_size = 0;
+    }
+
+    // The chip is brought up in the constructor and stays resident; the only
+    // thing we might need to do here is re-install the I2S driver if the
+    // last playback released it. reclaimMicI2sOnly is a no-op when RX is
+    // already up, so this is cheap.
+    if (!VtAudio::reclaimMicI2sOnly()) {
+        LOG_ERROR("Voicetastic: mic I2S reclaim failed");
+        return false;
+    }
+
+    // Truncate any previous capture and open the PCM file for writing.
+    if (FSCom.exists(VT_PCM_PATH)) FSCom.remove(VT_PCM_PATH);
+    rec_pcm_file = FSCom.open(VT_PCM_PATH, FILE_WRITE);
+    if (!rec_pcm_file) {
+        LOG_ERROR("Voicetastic: FSCom open(%s) for write failed", VT_PCM_PATH);
+        VtAudio::deinitMic();
+        return false;
+    }
+
+    rec_duration_ms = duration_ms;
+    rec_started_ms  = millis();
+    rec_frame_count = 0;
+    rec_pcm_accum_n = 0;
+    rec_state       = eRecRecording;
+    LOG_INFO("Voicetastic: recording started (%u ms) to %s", (unsigned)duration_ms, VT_PCM_PATH);
+    return true;
+}
+
+uint32_t VoicetasticModule::recordElapsedMs() const
+{
+    concurrency::LockGuard g(&state_lock_);
+    if (rec_state != eRecRecording) return 0;
+    return millis() - rec_started_ms;
+}
+
+bool VoicetasticModule::sendPending(NodeNum to, uint8_t channel)
+{
+    concurrency::LockGuard g(&state_lock_);
+    using namespace voicetastic;
+    if (pending_audio.empty() && !pending_audio_on_sd) return false;
+    if (tx_active) { LOG_WARN("Voicetastic: TX busy; cannot send pending audio yet"); return false; }
+
+    // Materialise the audio into a transient vector for buildOutbound.
+    // SD-backed: read the outbox file into a temp buffer (peak memory during
+    // the send window, same as the RAM-backed case). RAM-backed: just move
+    // out of pending_audio.
+    std::vector<uint8_t> audio;
+    if (pending_audio_on_sd) {
+#if defined(HAS_SDCARD)
+        File f = voicetastic::inbox::outboxOpenRead();
+        if (!f) {
+            LOG_ERROR("Voicetastic: outbox read open failed; cannot send");
+            return false;
+        }
+        audio.resize(pending_audio_size);
+        size_t got = 0;
+        {
+            concurrency::LockGuard spi_g(spiLock);
+            got = f.read(audio.data(), pending_audio_size);
+            f.close();
+        }
+        if (got != pending_audio_size) {
+            LOG_ERROR("Voicetastic: outbox short read %u/%u; cannot send",
+                      (unsigned)got, (unsigned)pending_audio_size);
+            return false;
+        }
+        voicetastic::inbox::outboxClear();
+        pending_audio_on_sd = false;
+#endif
+    } else {
+        audio = std::move(pending_audio);
+        pending_audio.clear();
+        pending_audio.shrink_to_fit();
+    }
+    pending_audio_size = 0;
+    if (audio.empty()) return false;
+    return enqueueOutboundLocked(audio.data(), audio.size(),
+                                 CodecId::CODEC2, (uint8_t)codec2_mode, to, channel);
+}
+
+void VoicetasticModule::discardPending()
+{
+    concurrency::LockGuard g(&state_lock_);
+    pending_audio.clear();
+    pending_audio.shrink_to_fit();
+    if (pending_audio_on_sd) {
+        voicetastic::inbox::outboxClear();
+        pending_audio_on_sd = false;
+    }
+    pending_audio_size = 0;
+}
+
+void VoicetasticModule::stopRecording()
+{
+    concurrency::LockGuard g(&state_lock_);
+    stopRecordingLocked();
+}
+
+void VoicetasticModule::stopRecordingLocked()
+{
+    using namespace voicetastic;
+    if (rec_state != eRecRecording) return;
+
+    // Close the write handle and reopen the same file for read. The encoder
+    // task inherits this single handle for the whole encoding pass — no need
+    // to re-open just to fstat the size.
+    if (rec_pcm_file) {
+        rec_pcm_file.flush();
+        rec_pcm_file.close();
+    }
+    if (!FSCom.exists(VT_PCM_PATH)) {
+        LOG_WARN("Voicetastic: no PCM file at %s after capture", VT_PCM_PATH);
+        rec_state = eRecIdle;
+        return;
+    }
+    rec_pcm_file = FSCom.open(VT_PCM_PATH, FILE_READ);
+    if (!rec_pcm_file) {
+        LOG_ERROR("Voicetastic: FSCom open(%s) for read failed", VT_PCM_PATH);
+        FSCom.remove(VT_PCM_PATH);
+        rec_state = eRecIdle;
+        return;
+    }
+    const size_t pcm_bytes = (size_t)rec_pcm_file.size();
+    enc_frames_total = (uint32_t)(pcm_bytes / VT_PCM_BYTES_PER_FRAME);
+    enc_frames_done  = 0;
+    LOG_INFO("Voicetastic: captured %u PCM bytes (%u frames); encoding to Codec2 mode ord=%u",
+             (unsigned)pcm_bytes, (unsigned)enc_frames_total, (unsigned)codec2_mode);
+
+    // NB: do NOT call VtAudio::deinitMic() here. Tearing the ES7210 down via
+    // I2C while the LVGL keyboard task is polling the TCA8418 on the same
+    // bus reliably faults the device on hardware. The mic stays resident for
+    // the lifetime of the firmware; cost is ~22 KB of RAM, which we have.
+
+    if (enc_frames_total == 0) {
+        // Nothing captured (e.g. user stopped immediately). Bail back to idle.
+        rec_pcm_file.close();
+        FSCom.remove(VT_PCM_PATH);
+        rec_state = eRecIdle;
+        return;
+    }
+    if (!VtAudio::initEncoder(codec2_mode)) {
+        LOG_ERROR("Voicetastic: codec2 init failed at encoding phase");
+        rec_pcm_file.close();
+        FSCom.remove(VT_PCM_PATH);
+        rec_state = eRecIdle;
+        return;
+    }
+    pending_audio.clear();
+
+    // Spawn the dedicated encoder worker task. 32 KB stack is generous — gives
+    // codec2_encode's FFT and LSP scratch all the headroom it needs without
+    // competing with the loop task's stack. Priority 1 = same as the TFT task
+    // so we don't preempt LVGL. The task self-deletes when it finishes the
+    // file and signals back via encoder_done.
+    encoder_done = false;
+    encoder_result_audio.clear();
+    encoder_result_audio.reserve((size_t)enc_frames_total * 8);
+    const BaseType_t rc = xTaskCreate(&VoicetasticModule::encoderTaskTrampoline,
+                                      "vtEncode", 32768, this, 1, &encoder_task);
+    if (rc != pdPASS) {
+        LOG_ERROR("Voicetastic: failed to create encoder task (rc=%d)", (int)rc);
+        encoder_task = nullptr;
+        rec_pcm_file.close();
+        FSCom.remove(VT_PCM_PATH);
+        VtAudio::deinitEncoder();
+        rec_state = eRecIdle;
+        return;
+    }
+    LOG_INFO("Voicetastic: encoder worker task started");
+    rec_state = eRecEncoding;
+}
+
+void VoicetasticModule::encoderTaskTrampoline(void *self)
+{
+    static_cast<VoicetasticModule *>(self)->encoderTaskBody();
+}
+
+// Look up Codec2 mode's bytes/frame + samples/frame without touching the
+// encoder/decoder instances (used to estimate playback duration before
+// allocating the worker task).
+static void vtCodec2FrameInfo(voicetastic::Codec2Mode mode, int &bytes_per_frame,
+                              int &samples_per_frame)
+{
+    using namespace voicetastic;
+    switch (mode) {
+    case Codec2Mode::M_3200: bytes_per_frame = 8; samples_per_frame = 160; break;
+    case Codec2Mode::M_2400: bytes_per_frame = 6; samples_per_frame = 160; break;
+    case Codec2Mode::M_1600: bytes_per_frame = 8; samples_per_frame = 320; break;
+    case Codec2Mode::M_1400: bytes_per_frame = 7; samples_per_frame = 320; break;
+    case Codec2Mode::M_1300: bytes_per_frame = 7; samples_per_frame = 320; break;
+    case Codec2Mode::M_1200: bytes_per_frame = 6; samples_per_frame = 320; break;
+    default: bytes_per_frame = 6; samples_per_frame = 320; break;
+    }
+}
+
+static uint32_t vtEstimateDurationMs(const voicetastic::ReceivedVoiceMessage &msg)
+{
+    int bpf = 6, spf = 320;
+    if (msg.codec == voicetastic::CodecId::CODEC2)
+        vtCodec2FrameInfo((voicetastic::Codec2Mode)msg.codec_param, bpf, spf);
+    if (bpf == 0) return 0;
+    // audio_size is authoritative whether the bytes live in msg.audio (RAM
+    // fallback) or in the SD inbox — both paths set it at publish time.
+    const uint32_t frames = (uint32_t)(msg.audio_size / (size_t)bpf);
+    return (frames * (uint32_t)spf) / 8; // samples_per_frame * 1000 / 8000 simplified
+}
+
+bool VoicetasticModule::startPlayback(const voicetastic::ReceivedVoiceMessage &msg)
+{
+    // Internal helper; callers (playNextPending, playByMessageId) already hold
+    // state_lock_. The Lock is non-recursive, so no LockGuard here.
+    using namespace voicetastic;
+    if (playing) return false;
+    if (rec_state != eRecIdle) return false;     // can't play while recording/encoding
+    // The message can be RAM-backed (audio vector non-empty) or SD-backed
+    // (audio_size > 0 and the worker streams from /voicetastic_inbox/...).
+    // Reject only the genuinely-empty case.
+    if (msg.audio_size == 0) return false;
+
+    playback_msg = msg; // copy metadata; if RAM-backed, also copies the vector
+    playback_done = false;
+    playback_stop_requested = false;
+    play_from_node = msg.from;
+    play_message_id = msg.message_id;
+    play_total_ms = vtEstimateDurationMs(msg);
+    play_started_ms = 0; // worker stamps this when it begins writing PCM
+
+    const BaseType_t rc = xTaskCreate(&VoicetasticModule::playbackTaskTrampoline,
+                                      "vtPlay", 32768, this, 1, &playback_task);
+    if (rc != pdPASS) {
+        LOG_ERROR("Voicetastic: failed to create playback task (rc=%d)", (int)rc);
+        playback_task = nullptr;
+        playback_msg.audio.clear();
+        playback_msg.audio_size = 0;
+        play_total_ms = 0;
+        play_from_node = 0;
+        play_message_id = 0;
+        return false;
+    }
+    playing = true;
+    LOG_INFO("Voicetastic: playback started mid=%08x (%u bytes, codec=%u/%u, ~%u ms)",
+             (unsigned)msg.message_id, (unsigned)msg.audio.size(),
+             (unsigned)msg.codec, (unsigned)msg.codec_param,
+             (unsigned)play_total_ms);
+    return true;
+}
+
+bool VoicetasticModule::playNextPending()
+{
+    concurrency::LockGuard g(&state_lock_);
+    if (pending_play_queue.empty()) return false;
+    if (playing) return false;
+    if (rec_state != eRecIdle) return false;
+    if (tx_active) return false;
+    // Play the first unplayed entry. Copy (don't move) so the audio stays in
+    // the inbox for re-play by the chat-screen mini-player; mark as played.
+    for (auto &m : pending_play_queue) {
+        if (m.played) continue;
+        voicetastic::ReceivedVoiceMessage copy = m;
+        m.played = true;
+        return startPlayback(copy);
+    }
+    // All already played: fall back to playing the oldest.
+    voicetastic::ReceivedVoiceMessage copy = pending_play_queue.front();
+    pending_play_queue.front().played = true;
+    return startPlayback(copy);
+}
+
+bool VoicetasticModule::playByMessageId(uint32_t message_id)
+{
+    concurrency::LockGuard g(&state_lock_);
+    if (playing) return false;
+    if (rec_state != eRecIdle) return false;
+    if (tx_active) return false;
+    for (auto &m : pending_play_queue) {
+        if (m.message_id == message_id) {
+            voicetastic::ReceivedVoiceMessage copy = m;
+            m.played = true;
+            return startPlayback(copy);
+        }
+    }
+    return false;
+}
+
+void VoicetasticModule::stopPlayback()
+{
+    concurrency::LockGuard g(&state_lock_);
+    if (!playing) return;
+    playback_stop_requested = true;
+}
+
+uint32_t VoicetasticModule::playbackElapsedMs() const
+{
+    concurrency::LockGuard g(&state_lock_);
+    if (!playing || play_started_ms == 0) return 0;
+    return millis() - play_started_ms;
+}
+
+bool VoicetasticModule::peekPending(size_t index, NodeNum &from, uint32_t &message_id,
+                                    uint32_t &approx_duration_ms) const
+{
+    concurrency::LockGuard g(&state_lock_);
+    if (index >= pending_play_queue.size()) return false;
+    const auto &m = pending_play_queue[index];
+    from = m.from;
+    message_id = m.message_id;
+    approx_duration_ms = vtEstimateDurationMs(m);
+    return true;
+}
+
+bool VoicetasticModule::peekPendingFull(size_t index, NodeNum &from, NodeNum &to,
+                                        uint8_t &channel, uint32_t &message_id,
+                                        uint32_t &approx_duration_ms, bool &played) const
+{
+    concurrency::LockGuard g(&state_lock_);
+    if (index >= pending_play_queue.size()) return false;
+    const auto &m = pending_play_queue[index];
+    from = m.from;
+    to = m.to;
+    channel = m.channel;
+    message_id = m.message_id;
+    approx_duration_ms = vtEstimateDurationMs(m);
+    played = m.played;
+    return true;
+}
+
+void VoicetasticModule::playbackTaskTrampoline(void *self)
+{
+    static_cast<VoicetasticModule *>(self)->playbackTaskBody();
+}
+
+void VoicetasticModule::playbackTaskBody()
+{
+    using namespace voicetastic;
+
+    // We need the DAC's I2S MCLK on GPIO 21, which is shared with ES7210_LRCK.
+    // Release just the I2S driver (and the shared pins) before bringing the
+    // DAC up. The ES7210 chip stays powered and configured — the only thing
+    // that changes here is which ESP32 peripheral owns the pins. This avoids
+    // the destructive I2C race against the TFT-task keyboard scanner that
+    // a full chip power-down would trigger.
+    VtAudio::releaseMicI2sOnly();
+
+    // NOTE: This worker MUST NOT write to playback_task. xTaskCreate fills
+    // that handle in *after* it returns; if this worker preempted the parent
+    // and ran to completion before xTaskCreate's return, a worker-side
+    // `playback_task = nullptr` would be clobbered by the parent's later
+    // handle write — leaving us with a dangling handle. Use vTaskDelete(NULL)
+    // to self-delete; the parent observes completion via playback_done.
+
+    if (!VtAudio::initDac()) {
+        LOG_ERROR("vtPlay: DAC init failed");
+        playback_done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+    if (!VtAudio::initDecoder((Codec2Mode)playback_msg.codec_param)) {
+        LOG_ERROR("vtPlay: codec2 decoder init failed");
+        VtAudio::deinitDac();
+        playback_done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const int samples_per_frame = VtAudio::samplesPerDecodedFrame();
+    const int bytes_per_frame   = VtAudio::bytesPerDecodedFrame();
+
+    int16_t pcm[640];   // ample for any Codec2 mode (max 320 @ mode 1200)
+
+    // The audio bytes can live in playback_msg.audio (RAM fallback) or in
+    // /voicetastic_inbox/<message_id>.c2 on SD. RAM-backed reads from a
+    // pointer + offset; SD-backed reads from a File in batches.
+    const bool     ram_backed = !playback_msg.audio.empty();
+    const uint8_t *src = ram_backed ? playback_msg.audio.data() : nullptr;
+    const size_t   total = playback_msg.audio_size;
+    size_t         consumed = 0;
+    uint32_t       frame_count = 0;
+
+    File sd_file;
+    constexpr int   kBatchFrames = 16;  // matches encoder-task batching cadence
+    std::vector<uint8_t> sd_batch;
+    size_t          sd_batch_len = 0;
+    size_t          sd_batch_pos = 0;
+
+    if (!ram_backed) {
+        sd_file = inbox::open(playback_msg.message_id);
+        if (!sd_file) {
+            LOG_ERROR("vtPlay: SD open for mid=%08x failed", (unsigned)playback_msg.message_id);
+            VtAudio::deinitDecoder();
+            VtAudio::deinitDac();
+            playback_done = true;
+            vTaskDelete(NULL);
+            return;
+        }
+        sd_batch.resize((size_t)bytes_per_frame * (size_t)kBatchFrames);
+    }
+
+    // Sub-frame write granularity. With a 64-sample DMA buffer at 8 kHz the
+    // hardware drains at 8 ms / 64 samples. Writing in 80-sample chunks
+    // (10 ms) makes the stop_requested check fire ~4x per Codec2 frame at
+    // mode 1200, so cancel latency from the UI is ~10 ms instead of the
+    // ~40 ms a whole-frame write would give us. Also lets us detect a
+    // genuinely stuck DAC mid-frame and abort cleanly.
+    constexpr int kWriteChunkSamples = 80;
+
+    play_started_ms = millis();
+    bool dac_stuck = false;
+    while (consumed + bytes_per_frame <= total) {
+        if (playback_stop_requested) {
+            LOG_INFO("vtPlay: stop requested, exiting at frame %u", (unsigned)frame_count);
+            break;
+        }
+        const uint8_t *frame_bytes;
+        if (ram_backed) {
+            frame_bytes = src + consumed;
+        } else {
+            // Refill the SD batch when we run out. Reads happen under spiLock
+            // because the SD card and TFT share the SPI bus.
+            if (sd_batch_pos + (size_t)bytes_per_frame > sd_batch_len) {
+                concurrency::LockGuard spi_g(spiLock);
+                sd_batch_len = sd_file.read(sd_batch.data(), sd_batch.size());
+                sd_batch_pos = 0;
+                if (sd_batch_len < (size_t)bytes_per_frame) break; // EOF
+            }
+            frame_bytes = sd_batch.data() + sd_batch_pos;
+            sd_batch_pos += (size_t)bytes_per_frame;
+        }
+        VtAudio::decodeFrame(frame_bytes, pcm);
+        for (int off = 0; off < samples_per_frame; off += kWriteChunkSamples) {
+            if (playback_stop_requested) break;
+            const int n = (off + kWriteChunkSamples <= samples_per_frame)
+                              ? kWriteChunkSamples
+                              : (samples_per_frame - off);
+            const size_t w = VtAudio::writePcm(pcm + off, (size_t)n);
+            if ((int)w < n) {
+                LOG_WARN("vtPlay: DAC short write %u/%d at frame %u — aborting",
+                         (unsigned)w, n, (unsigned)frame_count);
+                dac_stuck = true;
+                break;
+            }
+        }
+        if (dac_stuck) break;
+        consumed += bytes_per_frame;
+        frame_count++;
+        if ((frame_count % 25) == 0) {
+            LOG_DEBUG("vtPlay: decoded %u frames (%u/%u bytes %s)",
+                      (unsigned)frame_count, (unsigned)consumed, (unsigned)total,
+                      ram_backed ? "RAM" : "SD");
+        }
+    }
+
+    if (sd_file) {
+        concurrency::LockGuard spi_g(spiLock);
+        sd_file.close();
+    }
+
+    // Drain the DMA before tearing the DAC down.
+    vTaskDelay(pdMS_TO_TICKS(100));
+    VtAudio::deinitDecoder();
+    VtAudio::deinitDac();
+    // VtAudio::deinitDac() now resets the shared GPIO 21 (and the other DAC
+    // pins) back to INPUT, so the mic's I2S_NUM_1 install can claim LRCK
+    // cleanly. A short settle pause makes the transition reliable on the
+    // legacy i2s_legacy driver.
+    vTaskDelay(pdMS_TO_TICKS(20));
+    // I2S-only reclaim: the chip is still powered/configured from boot, so
+    // we just need to re-install the I2S RX driver and rebind the pins. No
+    // I2C bus traffic happens here.
+    if (!VtAudio::reclaimMicI2sOnly()) {
+        LOG_ERROR("vtPlay: mic I2S reclaim failed after playback; record disabled until reboot");
+    }
+
+    LOG_INFO("vtPlay: done, %u frames decoded", (unsigned)frame_count);
+    playback_done = true;
+    vTaskDelete(NULL);
+}
+
+void VoicetasticModule::encoderTaskBody()
+{
+    using namespace voicetastic;
+    // We're on the dedicated encoder task with 32 KB stack.
+    int16_t pcm[VT_PCM_SAMPLES_PER_FRAME];
+    uint8_t bits[16];
+    const int wanted_out = VtAudio::bytesPerCodec2Frame();
+    // The PCM file is captured at 320 samples/40ms chunks (mode 1200 size),
+    // but Codec2 frame size depends on mode: modes 3200/2400 want 160 samples
+    // per encode call, modes 1600..1200 want 320. Pull whatever the active
+    // encoder asks for — feeding 320 samples to a 160-sample encoder makes
+    // it silently drop the second half of every PCM chunk and produces the
+    // half-rate-garbled audio reported on higher bitrates.
+    const int codec_samples = VtAudio::samplesPerCodec2Frame();
+    const size_t codec_bytes_in = (size_t)codec_samples * sizeof(int16_t);
+    if (codec_samples <= 0 || codec_samples > VT_PCM_SAMPLES_PER_FRAME) {
+        LOG_ERROR("vtEncode: unexpected codec_samples=%d (max %d), aborting",
+                  codec_samples, (int)VT_PCM_SAMPLES_PER_FRAME);
+        if (rec_pcm_file) rec_pcm_file.close();
+        if (FSCom.exists(VT_PCM_PATH)) FSCom.remove(VT_PCM_PATH);
+        VtAudio::deinitEncoder();
+        // See handle-race rationale at end of this function: only the parent
+        // writes encoder_task.
+        encoder_done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+    uint32_t frame_count = 0;
+
+    // Batch reads so each FS hit pulls ~16 codec frames worth of PCM. With
+    // codec_bytes_in in {320, 640}, the batch is 5120 or 10240 bytes — small
+    // enough to comfortably allocate on the task stack via a vector reserve,
+    // and ~16x fewer FS calls than the previous per-frame loop. LittleFS
+    // serializes concurrent FS ops via esp_littlefs's per-mount mutex, so
+    // unrelated tasks (NodeDB save, prefs write) can stall a per-frame read
+    // for tens of ms; batching shrinks the window where the encoder is mid-
+    // op and means other tasks see clean FS slots between batches.
+    constexpr size_t kFramesPerRead = 16;
+    const size_t batch_bytes = codec_bytes_in * kFramesPerRead;
+    std::vector<uint8_t> batch(batch_bytes);
+
+    while (rec_pcm_file) {
+        const size_t got = rec_pcm_file.read(batch.data(), batch_bytes);
+        if (got < codec_bytes_in) break; // EOF or short read; nothing usable left
+        const size_t n_frames = got / codec_bytes_in;
+        for (size_t f = 0; f < n_frames; ++f) {
+            memcpy(pcm, batch.data() + f * codec_bytes_in, codec_bytes_in);
+            VtAudio::encodeFrame(pcm, bits);
+            encoder_result_audio.insert(encoder_result_audio.end(), bits, bits + wanted_out);
+            frame_count++;
+            if ((frame_count % 25) == 0) {
+                LOG_DEBUG("vtEncode: %u/%u frames (%u bytes)",
+                          (unsigned)frame_count, (unsigned)enc_frames_total,
+                          (unsigned)encoder_result_audio.size());
+            }
+        }
+        // Polite yield between batches so LVGL + other tasks get scheduling
+        // slots. One yield per batch (instead of per frame) is plenty — the
+        // batch takes ~50-100 ms wall to encode at 16 frames × few ms/frame.
+        vTaskDelay(pdMS_TO_TICKS(5));
+        if (got < batch_bytes) break; // partial batch = EOF reached
+    }
+
+    if (rec_pcm_file) rec_pcm_file.close();
+    if (FSCom.exists(VT_PCM_PATH)) FSCom.remove(VT_PCM_PATH);
+    VtAudio::deinitEncoder();
+    LOG_INFO("vtEncode: complete, %u bytes produced", (unsigned)encoder_result_audio.size());
+    // Same handle-race rationale as the playback worker: don't write to
+    // encoder_task here; only the parent (which gets the handle from
+    // xTaskCreate's out-pointer) is allowed to write that field. Signal
+    // completion via encoder_done (std::atomic) and let the parent reap.
+    encoder_done = true;
+    vTaskDelete(NULL);
+}
+
+void VoicetasticModule::recordFrame()
+{
+    using namespace voicetastic;
+    // Top up the accumulator with however many samples i2s_read can supply
+    // this tick. readPcm may return fewer than `need` samples if the DMA
+    // buffer hasn't accumulated enough by the timeout — partial returns
+    // happen routinely because the requested wall-time (40 ms for 320
+    // output samples at 8 kHz) exceeds the readPcm timeout (30 ms). We
+    // tolerate that by accumulating across runOnce ticks and only flushing
+    // to LittleFS when we hold a full 320-sample frame.
+    const uint16_t need = (uint16_t)(VT_PCM_SAMPLES_PER_FRAME - rec_pcm_accum_n);
+    const size_t got = VtAudio::readPcm(rec_pcm_accum + rec_pcm_accum_n, need, 30);
+    rec_pcm_accum_n += (uint16_t)got;
+
+    if (rec_pcm_accum_n >= VT_PCM_SAMPLES_PER_FRAME && rec_pcm_file) {
+        rec_pcm_file.write((const uint8_t *)rec_pcm_accum, VT_PCM_BYTES_PER_FRAME);
+        rec_frame_count++;
+        // Magnitude heartbeat every ~1 s: if pmax stays at 0 or a tiny single-
+        // digit value, the mic is producing silence and the captured audio
+        // will decode to nothing. A live mic should report pmax in the hundreds
+        // for ambient noise, thousands for speech.
+        if ((rec_frame_count % 25) == 0) {
+            int16_t pmax = 0;
+            for (int i = 0; i < VT_PCM_SAMPLES_PER_FRAME; i++) {
+                const int16_t a = rec_pcm_accum[i] < 0 ? (int16_t)-rec_pcm_accum[i] : rec_pcm_accum[i];
+                if (a > pmax) pmax = a;
+            }
+            LOG_DEBUG("vtRec: %u frames, pcm |max|=%d", (unsigned)rec_frame_count, (int)pmax);
+        }
+        rec_pcm_accum_n = 0;
+    }
+    if ((millis() - rec_started_ms) >= rec_duration_ms) {
+        // recordFrame() is invoked from runOnce() which already holds state_lock_.
+        // The Lock is non-recursive, so we must use the *Locked variant here.
+        stopRecordingLocked();
+    }
+}
+
+void VoicetasticModule::sendOneChunk()
+{
+    using namespace voicetastic;
+    const uint16_t walked = tx_next_chunk;
+    const bool is_data = walked < tx_msg.total_data;
+    const uint8_t  idx = is_data ? (uint8_t)walked : (uint8_t)(walked - tx_msg.total_data);
+    const bool is_last_in_stream =
+        (uint16_t)(walked + 1) == (uint16_t)tx_msg.total_data + (uint16_t)tx_msg.parity_count;
+    txSendShard(is_data, idx, is_last_in_stream);
+}
+
+void VoicetasticModule::sendDataRetransmit(uint8_t data_idx)
+{
+    using namespace voicetastic;
+    if (data_idx >= tx_msg.total_data) return;
+    // NACK-driven retransmits ride the same wire path; we leave last_in_stream
+    // clear since the original linear walk's terminal frame already carried it.
+    txSendShard(/*is_data=*/true, data_idx, /*last_in_stream=*/false);
+}
+
+void VoicetasticModule::txSendShard(bool is_data, uint8_t idx, bool last_in_stream)
+{
+    using namespace voicetastic;
+
+    // V3: header tag is always unkeyed SHA-256(header[0..12])[..4].
+    // Confidentiality is delegated to Meshtastic's per-packet AES-CTR.
+
+    VtHeader h{};
+    h.version        = PROTOCOL_VERSION;
+    h.packet_type    = is_data ? PacketType::DATA : PacketType::PARITY;
+    h.last_in_stream = last_in_stream;
+    h.message_id     = tx_msg.message_id;
+    h.codec          = tx_msg.codec;
+    h.codec_param    = tx_msg.codec_param;
+    h.stream_seq     = tx_msg.stream_seq;
+    h.chunk_index    = idx;
+    h.total_data     = tx_msg.total_data;
+    h.parity_count   = tx_msg.parity_count;
+
+    uint8_t header_buf[HEADER_SIZE] = {0};
+    if (encodeHeader(h, header_buf) != HEADER_SIZE) {
+        LOG_ERROR("Voicetastic: header encode failed (idx=%u)", (unsigned)idx);
+        return;
+    }
+
+    // Body: trimmed for final DATA, full for all others.
+    const std::vector<uint8_t> &src = is_data ? tx_msg.data[idx] : tx_msg.parity[idx];
+    const size_t body_len =
+        (is_data && idx == tx_msg.total_data - 1) ? tx_msg.last_data_real_size : (size_t)tx_msg.chunk_size;
+
+    meshtastic_MeshPacket *p = allocDataPacket();
+    p->to = tx_to;
+    p->channel = tx_channel;
+    p->want_ack = false;
+    p->decoded.want_response = false;
+    p->priority = meshtastic_MeshPacket_Priority_DEFAULT;
+
+    const size_t total = HEADER_SIZE + body_len;
+    if (total > sizeof(p->decoded.payload.bytes)) {
+        LOG_ERROR("Voicetastic: chunk too large (%u)", (unsigned)total);
+        p->decoded.payload.size = 0;
+        return;
+    }
+    memcpy(p->decoded.payload.bytes, header_buf, HEADER_SIZE);
+    memcpy(p->decoded.payload.bytes + HEADER_SIZE, src.data(), body_len);
+    p->decoded.payload.size = total;
+
+    LOG_DEBUG("Voicetastic: tx mid=%08x %s ci=%u/%u body=%u",
+              (unsigned)h.message_id, is_data ? "D" : "P",
+              (unsigned)h.chunk_index, (unsigned)tx_msg.total_data, (unsigned)body_len);
+    service->sendToMesh(p);
+}
+
+void VoicetasticModule::sendNack(const voicetastic::VtAssembler::PendingNack &nk)
+{
+    using namespace voicetastic;
+
+    VtHeader h{};
+    h.version        = PROTOCOL_VERSION;
+    h.packet_type    = PacketType::NACK;
+    h.last_in_stream = false;
+    h.message_id     = nk.message_id;
+    h.codec          = nk.codec;
+    h.codec_param    = nk.codec_param;
+    h.stream_seq     = nk.stream_seq;
+    h.chunk_index    = 0;         // spec §3.4
+    h.total_data     = nk.total_data;
+    h.parity_count   = nk.parity_count;
+
+    uint8_t header_buf[HEADER_SIZE] = {0};
+    if (encodeHeader(h, header_buf) != HEADER_SIZE) {
+        LOG_ERROR("Voicetastic: NACK header encode failed (mid=%08x)", (unsigned)nk.message_id);
+        return;
+    }
+
+    // Body: spec §3.4.
+    uint8_t body_buf[2 + ((255u + 7u) / 8u)] = {0};
+    // Convert vector<bool> to a plain bool array for encodeNackBody.
+    bool missing_buf[255] = {false};
+    for (uint8_t i = 0; i < nk.total_data; ++i) missing_buf[i] = nk.missing[i];
+    const size_t body_len = encodeNackBody(nk.total_data, missing_buf, nk.give_up,
+                                           body_buf, sizeof(body_buf));
+    if (body_len == 0) {
+        LOG_ERROR("Voicetastic: NACK body encode failed (mid=%08x total=%u)",
+                  (unsigned)nk.message_id, (unsigned)nk.total_data);
+        return;
+    }
+
+    meshtastic_MeshPacket *p = allocDataPacket();
+    p->to = nk.from;          // back to the original sender
+    p->channel = nk.channel;
+    p->want_ack = false;      // spec §3.4
+    p->decoded.want_response = false;
+    p->priority = meshtastic_MeshPacket_Priority_DEFAULT;
+
+    const size_t total = HEADER_SIZE + body_len;
+    if (total > sizeof(p->decoded.payload.bytes)) {
+        p->decoded.payload.size = 0;
+        return;
+    }
+    memcpy(p->decoded.payload.bytes, header_buf, HEADER_SIZE);
+    memcpy(p->decoded.payload.bytes + HEADER_SIZE, body_buf, body_len);
+    p->decoded.payload.size = total;
+
+    // Count missing for the log line.
+    unsigned nmiss = 0;
+    for (uint8_t i = 0; i < nk.total_data; ++i) if (nk.missing[i]) nmiss++;
+    LOG_INFO("Voicetastic: NACK mid=%08x to=0x%08x missing=%u/%u%s",
+             (unsigned)nk.message_id, (unsigned)nk.from, nmiss, (unsigned)nk.total_data,
+             nk.give_up ? " give_up" : "");
+    service->sendToMesh(p);
+}
+
+ProcessMessage VoicetasticModule::handleReceived(const meshtastic_MeshPacket &mp)
+{
+    // Disabled mode (no PSRAM): leave the packet for other PRIVATE_APP
+    // consumers; do not allocate any assembler buffers.
+    if (psram_missing) return ProcessMessage::CONTINUE;
+    concurrency::LockGuard g(&state_lock_);
+    using namespace voicetastic;
+    const auto &p = mp.decoded;
+
+    // Sub-header-sized packets and packets that fail the version+MAC check
+    // are not ours; let downstream modules on PRIVATE_APP see them.
+    if (p.payload.size < HEADER_SIZE) {
+        LOG_DEBUG("Voicetastic: drop short PRIVATE_APP packet (%u bytes)", (unsigned)p.payload.size);
+        return ProcessMessage::CONTINUE;
+    }
+
+    VtHeader h{};
+    if (!decodeHeader(p.payload.bytes, h)) {
+        LOG_DEBUG("Voicetastic: header reject (ver=0x%02x size=%u ch=%u)",
+                  (unsigned)p.payload.bytes[0], (unsigned)p.payload.size,
+                  (unsigned)mp.channel);
+        return ProcessMessage::CONTINUE;
+    }
+    // Past this point the packet is unambiguously ours (version 0x03 byte +
+    // valid SHA-256[..4] tag over the 12-byte logical header). Any other
+    // PRIVATE_APP consumer would just waste cycles parsing payload that
+    // isn't theirs, so we short-circuit further module dispatch with STOP.
+
+    const size_t body_len = p.payload.size - HEADER_SIZE;
+    char prefix[40];
+    snprintf(prefix, sizeof(prefix), "rx from=0x%08x body=%u", (unsigned)mp.from, (unsigned)body_len);
+    logHeader(prefix, h);
+
+    // Inbound NACK: route to the active TX state. We don't carry per-channel TX
+    // state — there's only one outbound message in flight at a time — so we
+    // match purely by message_id.
+    if (h.packet_type == PacketType::NACK) {
+        if (!tx_active || tx_msg.message_id != h.message_id) {
+            LOG_DEBUG("Voicetastic: NACK for mid=%08x ignored (no matching TX)",
+                      (unsigned)h.message_id);
+            return ProcessMessage::STOP;
+        }
+        if (h.total_data != tx_msg.total_data) {
+            LOG_WARN("Voicetastic: NACK mid=%08x rejected (total_data drift %u vs %u)",
+                     (unsigned)h.message_id, (unsigned)h.total_data, (unsigned)tx_msg.total_data);
+            return ProcessMessage::STOP;
+        }
+        bool missing_buf[255] = {false};
+        bool give_up = false;
+        if (!decodeNackBody(p.payload.bytes + HEADER_SIZE, body_len,
+                            h.total_data, missing_buf, give_up)) {
+            LOG_WARN("Voicetastic: NACK body decode failed (mid=%08x body=%u)",
+                     (unsigned)h.message_id, (unsigned)body_len);
+            return ProcessMessage::STOP;
+        }
+        if (give_up) {
+            LOG_INFO("Voicetastic: NACK give_up mid=%08x — aborting TX",
+                     (unsigned)h.message_id);
+            // Fully reset the TX state machine. Leaving tx_linger_until_ms /
+            // tx_next_chunk / tx_paced_until_ms non-zero is harmless today
+            // (enqueueOutboundLocked rewrites them) but is a brittle invariant
+            // — a future code path that reads them outside of tx_active would
+            // misbehave. Clear all of them here so "not transmitting" really
+            // means "no TX state lingers."
+            tx_active = false;
+            tx_linger_until_ms = 0;
+            tx_next_chunk = 0;
+            tx_paced_until_ms = 0;
+            retransmitClear();
+            tx_msg.data.clear();
+            tx_msg.parity.clear();
+            return ProcessMessage::STOP;
+        }
+        // Append missing data chunks to the retransmit queue, skipping ones
+        // already pending so a chatty NACK loop doesn't compound airtime.
+        unsigned added = 0;
+        for (uint8_t i = 0; i < h.total_data; ++i) {
+            if (!missing_buf[i]) continue;
+            if (!retransmitContains(i)) { retransmitPush(i); added++; }
+        }
+        // Extend the linger window to keep tx_msg state alive long enough to
+        // service the new retransmits.
+        tx_linger_until_ms = millis() + TX_NACK_LINGER_MS;
+        LOG_INFO("Voicetastic: NACK mid=%08x queued %u retransmits (queue=%u)",
+                 (unsigned)h.message_id, added, (unsigned)retransmitSize());
+        return ProcessMessage::STOP;
+    }
+
+    // Hand DATA / PARITY frames to the per-(from, message_id) assembler. It
+    // deals with shard storage, chunk_size inference (spec §4), FEC
+    // reconstruction, and queuing complete messages for playback (Phase 6).
+    if (assembler.acceptFrame(mp.from, mp.to, mp.channel, h,
+                              p.payload.bytes + HEADER_SIZE, body_len)) {
+        // A new message was just completed. Phase 6 will drain the assembler's
+        // complete-queue into the playback engine; for now we just leave it
+        // sitting there so anyone polling popComplete() can pick it up.
+    }
+    return ProcessMessage::STOP;
+}
+
+int32_t VoicetasticModule::runOnce()
+{
+    if (psram_missing) return 60000; // park the OSThread; nothing to do
+    concurrency::LockGuard g(&state_lock_);
+    using namespace voicetastic;
+    const uint32_t now = millis();
+
+    // Time out stuck inbound assemblies (absolute deadline) and check for
+    // chunks ready to NACK on the quiet-window timer.
+    assembler.tick(now);
+    {
+        VtAssembler::PendingNack nk;
+        if (assembler.pollPendingNack(nk, now)) {
+            sendNack(nk);
+        }
+    }
+
+    // Playback lifecycle. If a worker task is running, wait for it; on
+    // completion, clear state. Drain new assembler completions into our own
+    // pending_play_queue but do NOT auto-play -- the chat-screen mini-player
+    // calls playNextPending() explicitly when the user taps play.
+    if (playing && playback_done) {
+        playing = false;
+        playback_done = false;
+        playback_stop_requested = false;
+        playback_msg.audio.clear();
+        playback_msg.audio.shrink_to_fit();
+        play_total_ms = 0;
+        play_started_ms = 0;
+        play_from_node = 0;
+        play_message_id = 0;
+        LOG_INFO("Voicetastic: playback complete");
+    }
+    ReceivedVoiceMessage rxmsg;
+    while (assembler.popComplete(rxmsg)) {
+        LOG_INFO("Voicetastic: voice from 0x%08x queued for play (%u bytes %s)",
+                 (unsigned)rxmsg.from, (unsigned)rxmsg.audio_size,
+                 rxmsg.audio.empty() ? "SD" : "RAM");
+        pending_play_queue.push_back(std::move(rxmsg));
+        // Cap the inbox so a flood of voice messages doesn't OOM. ~16 entries.
+        // With SD-backed audio the per-entry RAM cost is just ~120 B of
+        // metadata; only the SD-side files grow per message (and clear on
+        // eviction). The RAM-fallback path keeps the original ~80 KB cap.
+        while (pending_play_queue.size() > kMaxInbox) {
+            // Delete the SD file (if any) for the evicted message so we
+            // don't leak it on disk.
+            voicetastic::inbox::erase(pending_play_queue.front().message_id);
+            pending_play_queue.erase(pending_play_queue.begin());
+        }
+    }
+
+#ifdef VOICETASTIC_BOOT_MIC_TEST
+    // One-shot boot test recording: ten seconds after boot, ask the codec2
+    // task to capture ~3 s and broadcast it. Opt-in via build flag; useful
+    // for verifying the mic + codec2 + TX path against voicetastic-desktop on
+    // a tethered radio when no manual trigger is wired yet.
+    if (!boot_test_sent && (now - boot_ms) > 10000) {
+        boot_test_sent = true;
+        if (!startRecording(3000)) {
+            LOG_ERROR("Voicetastic: boot record request rejected");
+        }
+    }
+#else
+    (void)boot_test_sent; (void)boot_ms;
+#endif
+
+    // SD-buffered recording state machine.
+    //   eRecRecording: read PCM from mic, write to SD. Cheap per-tick work,
+    //                  schedule back fast (5 ms).
+    //   eRecEncoding:  read one PCM frame from SD, run codec2_encode, append
+    //                  to pending_audio. codec2_encode is heavy on the loop
+    //                  task stack, so we pace at 50 ms between calls so LVGL
+    //                  + the rest of the firmware get plenty of slots.
+    if (rec_state == eRecRecording) {
+        recordFrame();
+        return 5;
+    }
+    if (rec_state == eRecEncoding) {
+        // Encoder worker is running on its own task; just poll its done flag.
+        if (encoder_done) {
+            const size_t produced = encoder_result_audio.size();
+            // Prefer SD for the "armed but not yet sent" window: flush the
+            // encoded bytes to /voicetastic_outbox.c2 and free the in-RAM
+            // copy. The user may let the captured message sit indefinitely
+            // before pressing send; keeping it on SD saves up to ~55 KB of
+            // resident PSRAM during that idle time.
+            pending_audio_on_sd = false;
+            pending_audio_size = 0;
+            pending_audio.clear();
+            pending_audio.shrink_to_fit();
+            if (produced > 0 && voicetastic::inbox::available()) {
+#if defined(HAS_SDCARD)
+                File f = voicetastic::inbox::outboxOpenWrite();
+                if (f) {
+                    concurrency::LockGuard spi_g(spiLock);
+                    const size_t wrote = f.write(encoder_result_audio.data(), produced);
+                    f.close();
+                    if (wrote == produced) {
+                        pending_audio_on_sd = true;
+                        pending_audio_size  = produced;
+                    } else {
+                        LOG_WARN("Voicetastic: outbox short write %u/%u, falling back to RAM",
+                                 (unsigned)wrote, (unsigned)produced);
+                        voicetastic::inbox::outboxClear();
+                    }
+                }
+#endif
+            }
+            if (!pending_audio_on_sd) {
+                pending_audio = std::move(encoder_result_audio);
+                pending_audio_size = pending_audio.size();
+            }
+            encoder_result_audio.clear();
+            encoder_result_audio.shrink_to_fit();
+            encoder_done = false;
+            rec_state = eRecIdle;
+            LOG_INFO("Voicetastic: encoding done, %u bytes ready (%s); ENTER to send",
+                     (unsigned)pending_audio_size,
+                     pending_audio_on_sd ? "SD" : "RAM");
+        }
+        return 100;
+    }
+
+    if (!tx_active) return 500;
+
+    const uint16_t total_chunks = (uint16_t)tx_msg.total_data + (uint16_t)tx_msg.parity_count;
+    const bool linear_walk_done = (tx_next_chunk >= total_chunks);
+
+    // Done? Linear walk complete AND no retransmits queued AND the NACK linger
+    // window has elapsed → tear down TX state.
+    if (linear_walk_done && retransmitEmpty()) {
+        if (tx_linger_until_ms == 0) {
+            // Just finished the linear walk; start the linger so we can still
+            // answer late NACKs (spec §8: NACK loop).
+            tx_linger_until_ms = now + TX_NACK_LINGER_MS;
+            LOG_INFO("Voicetastic: TX walk complete mid=%08x, linger %u ms for NACKs",
+                     (unsigned)tx_msg.message_id, (unsigned)TX_NACK_LINGER_MS);
+        } else if ((int32_t)(now - tx_linger_until_ms) >= 0) {
+            LOG_INFO("Voicetastic: TX teardown mid=%08x (%u chunks)",
+                     (unsigned)tx_msg.message_id, (unsigned)total_chunks);
+            tx_active = false;
+            tx_linger_until_ms = 0;
+            tx_msg.data.clear(); tx_msg.parity.clear();
+            return 500;
+        }
+        // Still inside linger window; idle but ready to react to NACKs.
+        return 100;
+    }
+
+    // Pacing window not yet elapsed?
+    if ((int32_t)(now - tx_paced_until_ms) < 0) {
+        return (int32_t)(tx_paced_until_ms - now);
+    }
+
+    // Firmware-queue backpressure (spec §2.2): pause while < 3 free slots.
+    meshtastic_QueueStatus qs = router->getQueueStatus();
+    if (qs.free <= 2) {
+        return 100;
+    }
+
+    // Retransmits ride ahead of the linear walk so NACKed chunks reach the
+    // receiver before we finish parity and tear down.
+    if (!retransmitEmpty()) {
+        sendDataRetransmit(retransmitPop());
+    } else {
+        sendOneChunk();
+        tx_next_chunk++;
+    }
+    const auto preset = (meshtastic_Config_LoRaConfig_ModemPreset)config.lora.modem_preset;
+    tx_paced_until_ms = now + pacingMsForPreset(preset);
+
+    return 10; // re-enter quickly; pacing/backpressure gates above
+}
+
+#endif // ARCH_ESP32 && !MESHTASTIC_EXCLUDE_VOICETASTIC

@@ -9,6 +9,10 @@
 #include "graphics/DeviceScreen.h"
 #include "graphics/driver/DisplayDriverConfig.h"
 
+#if defined(ARCH_ESP32) && defined(HAS_VOICETASTIC) && !MESHTASTIC_EXCLUDE_VOICETASTIC
+#include "graphics/comms/VoicetasticPacketClient.h"
+#endif
+
 #ifdef ARCH_PORTDUINO
 #include "PortduinoGlue.h"
 #include <thread>
@@ -43,7 +47,12 @@ void tftSetup(void)
 #ifndef ARCH_PORTDUINO
     deviceScreen = &DeviceScreen::create();
     PacketAPI::create(PacketServer::init());
+#if defined(ARCH_ESP32) && defined(HAS_VOICETASTIC) && !MESHTASTIC_EXCLUDE_VOICETASTIC
+    // Bridge that exposes Voicetastic record/send hooks to the device-ui chat screen.
+    deviceScreen->init(new VoicetasticPacketClient);
+#else
     deviceScreen->init(new PacketClient);
+#endif
 #else
     if (portduino_config.displayPanel != no_screen) {
         DisplayDriverConfig displayConfig;
