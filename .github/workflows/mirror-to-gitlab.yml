@@ -1,0 +1,51 @@
+# Mirror this repository to GitLab on every push.
+#
+# GitHub is canonical; GitLab (git.cha-sam.re/voicetastic/firmware) is a
+# strict read-only mirror — branches divergent on GitLab will be
+# overwritten. Required because GitLab CE doesn't offer pull-mirroring
+# (an EE feature), so we push from GitHub instead.
+#
+# Setup checklist (one-time):
+#   1. In GitLab → User Settings → Access Tokens, create a personal
+#      access token with the `write_repository` scope.
+#   2. In this repo, run:
+#        gh secret set GITLAB_TOKEN --body '<token>' -R voicetastic/firmware
+#   3. After setting the secret, trigger this workflow once manually
+#      via the Actions tab → "Mirror to GitLab" → Run workflow.
+#
+# Once configured, every subsequent push (and branch/tag deletion)
+# updates the GitLab side automatically.
+name: Mirror to GitLab
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  delete:
+  workflow_dispatch:
+
+# One mirror run at a time; don't cancel a run in flight because the
+# next push arrived (each run does a fresh `git clone --mirror` so
+# overlapping runs would just race on the GitLab side).
+concurrency:
+  group: mirror-to-gitlab
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Push GitHub → GitLab
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          if [ -z "$GITLAB_TOKEN" ]; then
+            echo "::error::GITLAB_TOKEN secret is not set. Create a GitLab personal access token with the write_repository scope and add it as a repo secret named GITLAB_TOKEN (see header comment in this workflow)."
+            exit 1
+          fi
+          # `git clone --mirror` brings all refs (branches, tags, notes)
+          # in one shot — simpler than reconstructing the ref layout
+          # from a working-tree checkout.
+          git clone --mirror "https://github.com/${GITHUB_REPOSITORY}.git" src.git
+          git -C src.git push --mirror \
+            "https://oauth2:${GITLAB_TOKEN}@git.cha-sam.re/voicetastic/firmware.git"
