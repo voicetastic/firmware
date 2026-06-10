@@ -167,17 +167,24 @@ jobs:
         run: |
           set -eu
           mkdir -p artifacts
-          # firmware.bin = OTA / app image
-          # firmware.factory.bin = bootloader + partitions + app
-          #   (factory image for a fresh board / browser flashing).
-          # The factory image is produced by meshtastic's custom
-          # post-build script; guard the copy in case a config doesn't
-          # emit it.
-          cp ".pio/build/t-deck-tft/firmware.bin" "artifacts/voicetastic-tdeck.bin"
-          if [ -f ".pio/build/t-deck-tft/firmware.factory.bin" ]; then
-            cp ".pio/build/t-deck-tft/firmware.factory.bin" "artifacts/voicetastic-tdeck-factory.bin"
+          build=".pio/build/t-deck-tft"
+          # Meshtastic's post-build renames the raw esptool output to a
+          # versioned name: firmware-<variant>-<version>.<sha>.bin (OTA) and
+          # ...<sha>.factory.bin (bootloader + partitions + app, for a fresh
+          # board / browser flashing). Older configs left an unversioned
+          # firmware.bin; resolve either, preferring the versioned name.
+          ota=$(ls "$build"/firmware-t-deck-tft-*.bin 2>/dev/null | grep -v '\.factory\.bin$' | head -n1 || true)
+          [ -z "$ota" ] && [ -f "$build/firmware.bin" ] && ota="$build/firmware.bin"
+          if [ -z "$ota" ]; then
+            echo "::error::no OTA firmware image found in $build"; ls -lh "$build" || true; exit 1
+          fi
+          cp "$ota" "artifacts/voicetastic-tdeck.bin"
+          factory=$(ls "$build"/firmware-t-deck-tft-*.factory.bin 2>/dev/null | head -n1 || true)
+          [ -z "$factory" ] && [ -f "$build/firmware.factory.bin" ] && factory="$build/firmware.factory.bin"
+          if [ -n "$factory" ]; then
+            cp "$factory" "artifacts/voicetastic-tdeck-factory.bin"
           else
-            echo "::warning::no firmware.factory.bin produced; only the OTA image will ship."
+            echo "::warning::no factory image produced; only the OTA image will ship."
           fi
           ls -lh artifacts/
 
