@@ -381,3 +381,26 @@ jobs:
             artifacts/voicetastic-tdeck.bin
             artifacts/voicetastic-tdeck-factory.bin
           fail_on_unmatched_files: false
+
+      # Tell the marketing site to rebuild so its /flash page picks up the
+      # new firmware (it bundles the binaries at build time). Needs a
+      # SITE_DISPATCH_TOKEN secret: a token with contents:write on
+      # voicetastic/voicetastic-site. Skipped gracefully if unset.
+      - name: Notify site to refresh flasher firmware
+        if: steps.tag.outputs.name != ''
+        env:
+          SITE_DISPATCH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          set -eu
+          if [ -z "${SITE_DISPATCH_TOKEN:-}" ]; then
+            echo "::notice::SITE_DISPATCH_TOKEN not set; skipping site rebuild dispatch"
+            exit 0
+          fi
+          curl -sSf -X POST \
+            -H "Authorization: Bearer ${SITE_DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/voicetastic/voicetastic-site/dispatches \
+            -d "{\"event_type\":\"firmware-released\",\"client_payload\":{\"tag\":\"${TAG}\"}}"
+          echo "dispatched firmware-released (${TAG}) to voicetastic/voicetastic-site"
