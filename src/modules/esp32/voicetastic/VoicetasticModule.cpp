@@ -124,6 +124,39 @@ static void runWireGoldenCheck()
             LOG_ERROR("Voicetastic wire-vector DRIFT vs core: %s got=%s want=%s", c.label, hex, c.expect);
         }
     }
+
+    // Reed-Solomon parity drift guard: rs::encode() must reproduce core's
+    // reed-solomon-erasure output byte-for-byte (rs/2data-2parity-32 in
+    // wire_vectors.txt) - a mismatch means FEC silently fails to recover across
+    // implementations. Data shards are a deterministic ramp: shard s, byte i =
+    // (s*32 + i) & 0xff.
+    {
+        rs::init();
+        constexpr int D = 2, P = 2;
+        constexpr size_t SZ = 32;
+        uint8_t d0[SZ], d1[SZ], p0[SZ], p1[SZ];
+        for (size_t i = 0; i < SZ; i++) {
+            d0[i] = (uint8_t)i;
+            d1[i] = (uint8_t)(SZ + i);
+        }
+        const uint8_t *data[D] = {d0, d1};
+        uint8_t *parity[P] = {p0, p1};
+        static const char *expect = "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"
+                                    "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f";
+        if (!rs::encode(D, P, SZ, data, parity)) {
+            LOG_ERROR("Voicetastic wire-vector: rs/2data-2parity-32 rs::encode failed");
+        } else {
+            char hex[2 * SZ * P + 1] = {0};
+            for (int p = 0; p < P; p++)
+                for (size_t i = 0; i < SZ; i++)
+                    snprintf(hex + (p * SZ + i) * 2, 3, "%02x", parity[p][i]);
+            if (strcmp(hex, expect) == 0) {
+                LOG_INFO("Voicetastic wire-vector OK: rs/2data-2parity-32");
+            } else {
+                LOG_ERROR("Voicetastic wire-vector DRIFT vs core: rs/2data-2parity-32 got=%s want=%s", hex, expect);
+            }
+        }
+    }
 }
 
 VoicetasticModule::VoicetasticModule()
