@@ -18,6 +18,12 @@
 #include <esp_random.h>
 #include <string.h>
 
+#ifdef VT_CORE_LINKED
+// C ABI of voicetastic-esp32-bridge; the header's include dir is added by
+// bin/vtcore-link.py (opt-in t-deck-tft-vtcore env only).
+#include "voicetastic_core.h"
+#endif
+
 // NVS namespace + key for the persisted Codec2 encode mode. Namespace must be
 // ≤ 15 chars and key ≤ 15 chars (ESP-IDF NVS limit).
 static constexpr const char *VT_NVS_NAMESPACE = "voicetastic";
@@ -87,6 +93,14 @@ VoicetasticModule::VoicetasticModule()
     : SinglePortModule("Voicetastic", meshtastic_PortNum_PRIVATE_APP), concurrency::OSThread("Voicetastic")
 {
     LOG_INFO("Voicetastic module init (port=%d, scope=TX+RX Codec2 plaintext+FEC)", (int)meshtastic_PortNum_PRIVATE_APP);
+#ifdef VT_CORE_LINKED
+    // Slice 1 toolchain proof: confirm the voicetastic-core C ABI bridge linked
+    // and core's Codec2 is callable on-device. If these print over serial, the
+    // Rust-core-in-firmware path is real and the surface can grow to the
+    // sans-IO protocol. Only compiled in the opt-in `t-deck-tft-vtcore` env.
+    LOG_INFO("Voicetastic: voicetastic-core linked: %s", vt_core_version());
+    LOG_INFO("Voicetastic: core Codec2 smoke (1200 bps) = %d bytes", vt_codec2_smoke(5));
+#endif
     // The build-time #error in VoicetasticModule.h enforces BOARD_HAS_PSRAM,
     // but a board could declare PSRAM and then fail to detect it at runtime
     // (bad chip, bad SPI lines, wrong frequency). Surface that here as a hard
