@@ -98,8 +98,12 @@ VoicetasticModule::VoicetasticModule()
     // protocol (header/MAC/chunker/Reed-Solomon + the firmware-heap-backed
     // allocator) and returns the frame count. If these print over serial, the
     // single-core protocol runs on the T-Deck. Opt-in `t-deck-tft-vtcore` env.
+    // Staged so the LAST line printed before any crash localizes the fault
+    // (each LOG_INFO flushes on the USB-CDC console before the next FFI call).
     LOG_INFO("Voicetastic: voicetastic-core linked: %s", vt_core_version());
-    LOG_INFO("Voicetastic: proto self-test (chunk+FEC) = %d frames", vt_proto_selftest());
+    LOG_INFO("Voicetastic: vt_alloc_smoke = %d (expect 1)", vt_alloc_smoke());
+    LOG_INFO("Voicetastic: vt_header_smoke = %d (expect 0)", vt_header_smoke());
+    LOG_INFO("Voicetastic: vt_proto_selftest = %d frames (expect 4)", vt_proto_selftest());
 #endif
     // The build-time #error in VoicetasticModule.h enforces BOARD_HAS_PSRAM,
     // but a board could declare PSRAM and then fail to detect it at runtime
