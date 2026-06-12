@@ -28,6 +28,20 @@ extern "C" void vt_host_log(const char *msg)
 {
     LOG_ERROR("Voicetastic[rust]: %s", msg);
 }
+
+// The RS-encode path needs more stack than the boot ctor task has (~3.6 KB
+// free), so run vt_proto_selftest on a dedicated 16 KB task and report the
+// frame count + how much stack RS actually used.
+static volatile bool s_vtRsDone = false;
+static volatile int s_vtRsFrames = -1;
+static volatile unsigned s_vtRsStackMinFree = 0;
+static void vtRsSelfTestTask(void *)
+{
+    s_vtRsFrames = vt_proto_selftest();
+    s_vtRsStackMinFree = (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t));
+    s_vtRsDone = true;
+    vTaskDelete(nullptr);
+}
 #endif
 
 // NVS namespace + key for the persisted Codec2 encode mode. Namespace must be
@@ -117,7 +131,15 @@ VoicetasticModule::VoicetasticModule()
     LOG_INFO("Voicetastic[vt]: header_smoke=%d (expect 0)", vt_header_smoke());
     LOG_INFO("Voicetastic[vt]: chunk_smoke=%d (expect 2)", vt_chunk_smoke());
     LOG_INFO("Voicetastic[vt]: pre-RS heap_free=%u stack_min_free=%u", (unsigned)memGet.getFreeHeap(), vtStackFree());
-    LOG_INFO("Voicetastic[vt]: proto_selftest(RS)=%d frames (expect 4)", vt_proto_selftest());
+    // Run RS on a 16 KB task (the boot ctor stack is too small for it).
+    if (xTaskCreate(vtRsSelfTestTask, "vtRs", 16384, nullptr, 5, nullptr) == pdPASS) {
+        for (int i = 0; i < 500 && !s_vtRsDone; i++)
+            vTaskDelay(pdMS_TO_TICKS(10));
+        LOG_INFO("Voicetastic[vt]: proto_selftest(RS @16KB task)=%d frames (expect 4); rs_used_stack=%u of 16384", s_vtRsFrames,
+                 16384 - s_vtRsStackMinFree);
+    } else {
+        LOG_ERROR("Voicetastic[vt]: could not spawn RS task");
+    }
 #endif
     // The build-time #error in VoicetasticModule.h enforces BOARD_HAS_PSRAM,
     // but a board could declare PSRAM and then fail to detect it at runtime
