@@ -157,6 +157,79 @@ static void runWireGoldenCheck()
             }
         }
     }
+
+    // Full-message frame drift guard: buildOutbound() (chunker + RS) followed by
+    // per-shard framing must reproduce core's build_message() frames byte-for-
+    // byte. Case msg/vls-100b-chunk48-fec1 in wire_vectors.txt: the VERY_LONG_SLOW
+    // preset (chunk_size 48) on 100 B of ramp audio (byte i = i & 0xff) ->
+    // total_data = ceil(100/48) = 3, parity = defaultParityCount(3) = 1. This
+    // exercises chunk boundaries, last-chunk padding, the trimmed final DATA
+    // frame (4 real bytes), the parity frame, and last_in_stream placement all
+    // at once - the single most complete cross-impl wire check. The framing here
+    // mirrors txSendShard() exactly (header(16) then body, final DATA trimmed).
+    {
+        uint8_t audio[100];
+        for (size_t i = 0; i < sizeof(audio); i++)
+            audio[i] = (uint8_t)i;
+        static const char *expect = "0300cafe0001030503000301bd9d0738000102030405060708090a0b0c0d0e0f"
+                                    "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"
+                                    "0300cafe0001030503010301af43459b303132333435363738393a3b3c3d3e3f"
+                                    "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"
+                                    "0300cafe0001030503020301b3a5cb15606162630350cafe0001030503000301"
+                                    "6ba2578d50515253303030303030303030303030505050505050505050505050"
+                                    "5050505070707070707070707070707070707070";
+        OutboundMessage om;
+        if (!buildOutbound(audio, sizeof(audio), meshtastic_Config_LoRaConfig_ModemPreset_VERY_LONG_SLOW, CodecId::CODEC2, 5,
+                           0xCAFE0001, 3, om)) {
+            LOG_ERROR("Voicetastic wire-vector: msg/vls-100b-chunk48-fec1 buildOutbound failed");
+        } else {
+            char hex[512] = {0};
+            size_t off = 0;
+            const uint16_t total_shards = (uint16_t)om.total_data + om.parity_count;
+            uint16_t gidx = 0;
+            bool ok = true;
+            auto frameShard = [&](bool is_data, uint8_t idx) {
+                if (!ok)
+                    return;
+                VtHeader h{};
+                h.version = PROTOCOL_VERSION;
+                h.packet_type = is_data ? PacketType::DATA : PacketType::PARITY;
+                h.last_in_stream = (gidx == (uint16_t)(total_shards - 1));
+                h.message_id = om.message_id;
+                h.codec = om.codec;
+                h.codec_param = om.codec_param;
+                h.stream_seq = om.stream_seq;
+                h.chunk_index = idx;
+                h.total_data = om.total_data;
+                h.parity_count = om.parity_count;
+                gidx++;
+                uint8_t hb[HEADER_SIZE] = {0};
+                if (encodeHeader(h, hb) != HEADER_SIZE) {
+                    ok = false;
+                    return;
+                }
+                const std::vector<uint8_t> &src = is_data ? om.data[idx] : om.parity[idx];
+                const size_t body_len = (is_data && idx == om.total_data - 1) ? om.last_data_real_size : (size_t)om.chunk_size;
+                for (size_t i = 0; i < HEADER_SIZE && off + 2 < sizeof(hex); i++, off += 2)
+                    snprintf(hex + off, 3, "%02x", hb[i]);
+                for (size_t i = 0; i < body_len && off + 2 < sizeof(hex); i++, off += 2)
+                    snprintf(hex + off, 3, "%02x", src[i]);
+            };
+            for (uint8_t i = 0; i < om.total_data; i++)
+                frameShard(true, i);
+            for (uint8_t i = 0; i < om.parity_count; i++)
+                frameShard(false, i);
+            if (!ok) {
+                LOG_ERROR("Voicetastic wire-vector: msg/vls-100b-chunk48-fec1 encodeHeader rejected");
+            } else if (strcmp(hex, expect) == 0) {
+                LOG_INFO("Voicetastic wire-vector OK: msg/vls-100b-chunk48-fec1");
+            } else {
+                LOG_ERROR("Voicetastic wire-vector DRIFT vs core: msg/vls-100b-chunk48-fec1");
+                LOG_ERROR("  got =%s", hex);
+                LOG_ERROR("  want=%s", expect);
+            }
+        }
+    }
 }
 
 VoicetasticModule::VoicetasticModule()
