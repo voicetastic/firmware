@@ -107,10 +107,17 @@ VoicetasticModule::VoicetasticModule()
     // Staged so the LAST line printed before any crash localizes the fault
     // (each LOG_INFO flushes on the USB-CDC console before the next FFI call).
     LOG_INFO("Voicetastic: voicetastic-core linked: %s", vt_core_version());
-    LOG_INFO("Voicetastic: vt_alloc_smoke = %d (expect 1)", vt_alloc_smoke());
-    LOG_INFO("Voicetastic: vt_header_smoke = %d (expect 0)", vt_header_smoke());
-    LOG_INFO("Voicetastic: vt_chunk_smoke = %d (expect 2)", vt_chunk_smoke());
-    LOG_INFO("Voicetastic: vt_proto_selftest = %d frames (expect 4)", vt_proto_selftest());
+    // Resource metrics around each stage so a crash explains itself: a small
+    // stack_min_free before the RS call == stack overflow; heap rules out OOM.
+    // stack_min_free = lowest free bytes this task has ever had (FreeRTOS).
+    auto vtStackFree = []() -> unsigned { return (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)); };
+    LOG_INFO("Voicetastic[vt]: heap_free=%u psram_free=%u stack_min_free=%u", (unsigned)memGet.getFreeHeap(),
+             (unsigned)memGet.getFreePsram(), vtStackFree());
+    LOG_INFO("Voicetastic[vt]: alloc_smoke=%d (expect 1)", vt_alloc_smoke());
+    LOG_INFO("Voicetastic[vt]: header_smoke=%d (expect 0)", vt_header_smoke());
+    LOG_INFO("Voicetastic[vt]: chunk_smoke=%d (expect 2)", vt_chunk_smoke());
+    LOG_INFO("Voicetastic[vt]: pre-RS heap_free=%u stack_min_free=%u", (unsigned)memGet.getFreeHeap(), vtStackFree());
+    LOG_INFO("Voicetastic[vt]: proto_selftest(RS)=%d frames (expect 4)", vt_proto_selftest());
 #endif
     // The build-time #error in VoicetasticModule.h enforces BOARD_HAS_PSRAM,
     // but a board could declare PSRAM and then fail to detect it at runtime
