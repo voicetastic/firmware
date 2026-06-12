@@ -22,6 +22,12 @@
 // C ABI of voicetastic-esp32-bridge; the header's include dir is added by
 // bin/vtcore-link.py (opt-in t-deck-tft-vtcore env only).
 #include "voicetastic_core.h"
+// Visible-console sink for the Rust bridge's panic handler (esp_rom_printf
+// goes to UART0, not the S3's USB-CDC console).
+extern "C" void vt_host_log(const char *msg)
+{
+    LOG_ERROR("Voicetastic[rust]: %s", msg);
+}
 #endif
 
 // NVS namespace + key for the persisted Codec2 encode mode. Namespace must be
@@ -103,6 +109,7 @@ VoicetasticModule::VoicetasticModule()
     LOG_INFO("Voicetastic: voicetastic-core linked: %s", vt_core_version());
     LOG_INFO("Voicetastic: vt_alloc_smoke = %d (expect 1)", vt_alloc_smoke());
     LOG_INFO("Voicetastic: vt_header_smoke = %d (expect 0)", vt_header_smoke());
+    LOG_INFO("Voicetastic: vt_chunk_smoke = %d (expect 2)", vt_chunk_smoke());
     LOG_INFO("Voicetastic: vt_proto_selftest = %d frames (expect 4)", vt_proto_selftest());
 #endif
     // The build-time #error in VoicetasticModule.h enforces BOARD_HAS_PSRAM,

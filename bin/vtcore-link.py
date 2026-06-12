@@ -22,7 +22,7 @@ CRATE = "voicetastic-esp32-bridge"
 CORE_REPO = "https://github.com/voicetastic/voicetastic-core.git"
 # Pinned rev: no_std bridge over voicetastic-proto (branch feat/voicetastic-proto).
 # Repoint to a `main` tag/rev once the proto + bridge PRs land.
-VT_CORE_REV = "de40d73f77c8d2a757457dec2bf117feb5d88539"
+VT_CORE_REV = "94fb2e52684dc7b9eab13333936641bc3927c853"
 
 project_dir = env["PROJECT_DIR"]  # noqa: F821
 core_dir = os.environ.get("VT_CORE_DIR")
