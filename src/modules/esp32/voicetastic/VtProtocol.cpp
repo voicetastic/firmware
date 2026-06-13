@@ -6,7 +6,8 @@
 #include "configuration.h"
 #include <string.h>
 
-namespace voicetastic {
+namespace voicetastic
+{
 
 static inline void put_be32(uint8_t *p, uint32_t v)
 {
@@ -44,16 +45,17 @@ size_t encodeHeader(const VtHeader &h, uint8_t out[HEADER_SIZE])
 
     uint8_t type_flags = 0;
     type_flags |= (uint8_t)((uint8_t)h.packet_type << PACKET_TYPE_SHIFT) & MASK_PACKET_TYPE;
-    if (h.last_in_stream)   type_flags |= MASK_LAST_IN_STREAM;
+    if (h.last_in_stream)
+        type_flags |= MASK_LAST_IN_STREAM;
     // Reserved bits (0x2F) implicitly 0.
 
-    out[0]  = h.version;
-    out[1]  = type_flags;
+    out[0] = h.version;
+    out[1] = type_flags;
     put_be32(out + 2, h.message_id);
-    out[6]  = (uint8_t)h.codec;
-    out[7]  = h.codec_param;
-    out[8]  = h.stream_seq;
-    out[9]  = h.chunk_index;
+    out[6] = (uint8_t)h.codec;
+    out[7] = h.codec_param;
+    out[8] = h.stream_seq;
+    out[9] = h.chunk_index;
     out[10] = h.total_data;
     out[11] = h.parity_count;
 
@@ -86,26 +88,33 @@ bool decodeHeader(const uint8_t in[HEADER_SIZE], VtHeader &out)
     if (parity_count > MAX_PARITY_PER_MESSAGE)
         return false;
 
-    out.version        = in[0];
-    out.packet_type    = pt;
+    // spec §3.2 / §9.2: codec ids 4..255 are reserved; receivers MUST drop
+    // frames carrying an unknown codec.
+    const uint8_t codec = in[6];
+    if (codec > (uint8_t)CodecId::CODEC2)
+        return false;
+
+    out.version = in[0];
+    out.packet_type = pt;
     out.last_in_stream = (type_flags & MASK_LAST_IN_STREAM) != 0;
-    out.message_id     = get_be32(in + 2);
-    out.codec          = (CodecId)in[6];
-    out.codec_param    = in[7];
-    out.stream_seq     = in[8];
-    out.chunk_index    = in[9];
-    out.total_data     = total_data;
-    out.parity_count   = parity_count;
+    out.message_id = get_be32(in + 2);
+    out.codec = (CodecId)codec;
+    out.codec_param = in[7];
+    out.stream_seq = in[8];
+    out.chunk_index = in[9];
+    out.total_data = total_data;
+    out.parity_count = parity_count;
     return true;
 }
 
-size_t encodeNackBody(uint8_t total_data, const bool *missing, bool give_up,
-                      uint8_t *out, size_t out_max)
+size_t encodeNackBody(uint8_t total_data, const bool *missing, bool give_up, uint8_t *out, size_t out_max)
 {
-    if (total_data == 0 || missing == nullptr || out == nullptr) return 0;
+    if (total_data == 0 || missing == nullptr || out == nullptr)
+        return 0;
     const size_t bitmap_len = ((size_t)total_data + 7u) / 8u;
     const size_t needed = 2 + bitmap_len;
-    if (out_max < needed) return 0;
+    if (out_max < needed)
+        return 0;
 
     out[0] = NACK_VERSION;
     out[1] = give_up ? NACK_FLAG_GIVE_UP : 0;
@@ -121,10 +130,10 @@ size_t encodeNackBody(uint8_t total_data, const bool *missing, bool give_up,
     return needed;
 }
 
-bool decodeNackBody(const uint8_t *body, size_t body_len, uint8_t total_data,
-                    bool *missing_out, bool &give_up_out)
+bool decodeNackBody(const uint8_t *body, size_t body_len, uint8_t total_data, bool *missing_out, bool &give_up_out)
 {
-    if (body == nullptr || missing_out == nullptr || total_data == 0) return false;
+    if (body == nullptr || missing_out == nullptr || total_data == 0)
+        return false;
     const size_t bitmap_len = ((size_t)total_data + 7u) / 8u;
     // Exact-size match. The encoder side writes exactly `2 + bitmap_len`
     // bytes; tolerating trailing bytes here would silently accept malformed
@@ -132,9 +141,12 @@ bool decodeNackBody(const uint8_t *body, size_t body_len, uint8_t total_data,
     // If/when nack_version is bumped to add fields, this check will need to
     // become "match a version-keyed expected length" — but for v1 it's a
     // straight equality.
-    if (body_len != 2 + bitmap_len) return false;
-    if (body[0] != NACK_VERSION) return false;
-    if ((body[1] & ~NACK_FLAG_GIVE_UP) != 0) return false; // reserved bits
+    if (body_len != 2 + bitmap_len)
+        return false;
+    if (body[0] != NACK_VERSION)
+        return false;
+    if ((body[1] & ~NACK_FLAG_GIVE_UP) != 0)
+        return false; // reserved bits
 
     give_up_out = (body[1] & NACK_FLAG_GIVE_UP) != 0;
     for (uint8_t i = 0; i < total_data; ++i) {
@@ -147,17 +159,13 @@ bool decodeNackBody(const uint8_t *body, size_t body_len, uint8_t total_data,
 
 void logHeader(const char *prefix, const VtHeader &h)
 {
-    const char *type_str =
-        h.packet_type == PacketType::DATA     ? "DATA"     :
-        h.packet_type == PacketType::PARITY   ? "PARITY"   :
-        h.packet_type == PacketType::NACK     ? "NACK"     : "RES";
-    LOG_INFO("%s vt3 mid=%08x %s ci=%u/%u par=%u codec=%u/%u seq=%u%s",
-             prefix,
-             (unsigned)h.message_id, type_str,
-             (unsigned)h.chunk_index, (unsigned)h.total_data, (unsigned)h.parity_count,
-             (unsigned)h.codec, (unsigned)h.codec_param,
-             (unsigned)h.stream_seq,
-             h.last_in_stream ? " last" : "");
+    const char *type_str = h.packet_type == PacketType::DATA     ? "DATA"
+                           : h.packet_type == PacketType::PARITY ? "PARITY"
+                           : h.packet_type == PacketType::NACK   ? "NACK"
+                                                                 : "RES";
+    LOG_INFO("%s vt3 mid=%08x %s ci=%u/%u par=%u codec=%u/%u seq=%u%s", prefix, (unsigned)h.message_id, type_str,
+             (unsigned)h.chunk_index, (unsigned)h.total_data, (unsigned)h.parity_count, (unsigned)h.codec,
+             (unsigned)h.codec_param, (unsigned)h.stream_seq, h.last_in_stream ? " last" : "");
 }
 
 } // namespace voicetastic
