@@ -86,11 +86,17 @@ bool decodeHeader(const uint8_t in[HEADER_SIZE], VtHeader &out)
     if (parity_count > MAX_PARITY_PER_MESSAGE)
         return false;
 
+    // spec §3.2 / §9.2: codec ids 4..255 are reserved; receivers MUST drop
+    // frames carrying an unknown codec.
+    const uint8_t codec = in[6];
+    if (codec > (uint8_t)CodecId::CODEC2)
+        return false;
+
     out.version        = in[0];
     out.packet_type    = pt;
     out.last_in_stream = (type_flags & MASK_LAST_IN_STREAM) != 0;
     out.message_id     = get_be32(in + 2);
-    out.codec          = (CodecId)in[6];
+    out.codec          = (CodecId)codec;
     out.codec_param    = in[7];
     out.stream_seq     = in[8];
     out.chunk_index    = in[9];

@@ -81,6 +81,7 @@ size_t encodeHeader(const VtHeader &h, uint8_t out[HEADER_SIZE]);
 //   - SHA-256(in[0..12])[..4] matches the trailing tag
 //   - total_data != 0  (per spec §9.2 rejection rule)
 //   - parity_count <= MAX_PARITY_PER_MESSAGE
+//   - codec <= CODEC2  (spec §3.2 / §9.2: ids 4..255 reserved ⇒ drop)
 // On false: `out` is left in an undefined state.
 bool decodeHeader(const uint8_t in[HEADER_SIZE], VtHeader &out);
 
