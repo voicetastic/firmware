@@ -286,10 +286,10 @@ esp_err_t es7210_adc_init(TwoWire *tw,  audio_hal_codec_config_t *codec_cfg)
     ret |= es7210_write_reg(ES7210_CLOCK_OFF_REG01, 0x1f);
     ret |= es7210_write_reg(ES7210_TIME_CONTROL0_REG09, 0x30);      /* Set chip state cycle */
     ret |= es7210_write_reg(ES7210_TIME_CONTROL1_REG0A, 0x30);      /* Set power on state cycle */
-    // ret |= es7210_write_reg(ES7210_ADC12_HPF2_REG23, 0x2a);         /* Quick setup */
-    // ret |= es7210_write_reg(ES7210_ADC12_HPF1_REG22, 0x0a);
-    // ret |= es7210_write_reg(ES7210_ADC34_HPF2_REG20, 0x0a);
-    // ret |= es7210_write_reg(ES7210_ADC34_HPF1_REG21, 0x2a);
+    ret |= es7210_write_reg(ES7210_ADC12_HPF2_REG23, 0x2a);         /* Quick setup */
+    ret |= es7210_write_reg(ES7210_ADC12_HPF1_REG22, 0x0a);
+    ret |= es7210_write_reg(ES7210_ADC34_HPF2_REG20, 0x0a);
+    ret |= es7210_write_reg(ES7210_ADC34_HPF1_REG21, 0x2a);
     /* Set master/slave audio interface */
     audio_hal_codec_i2s_iface_t *i2s_cfg = & (codec_cfg->i2s_iface);
     switch (i2s_cfg->mode) {
