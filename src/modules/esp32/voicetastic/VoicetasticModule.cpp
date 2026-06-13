@@ -362,6 +362,10 @@ bool VoicetasticModule::enqueueOutboundLocked(const uint8_t *audio, size_t audio
 
     tx_to = to;
     tx_channel = channel;
+    // Each enqueue is a complete one-shot recording today, so it is the last
+    // (and only) message of its session. A future multi-message splitter would
+    // set this false on all but the final message before enqueueing them.
+    tx_last_in_session = true;
     retransmitClear();
     tx_linger_until_ms = 0;
     tx_next_chunk = 0;
@@ -1103,7 +1107,13 @@ void VoicetasticModule::sendOneChunk()
     const uint16_t walked = tx_next_chunk;
     const bool is_data = walked < tx_msg.total_data;
     const uint8_t idx = is_data ? (uint8_t)walked : (uint8_t)(walked - tx_msg.total_data);
-    const bool is_last_in_stream = (uint16_t)(walked + 1) == (uint16_t)tx_msg.total_data + (uint16_t)tx_msg.parity_count;
+    // last_in_stream marks the final frame of the final message in a session
+    // (spec semantics). The last shard of *this* message only carries it when
+    // this message is also the last of its session - otherwise an intermediate
+    // message would falsely signal stream-end. Matches core's
+    // `cfg.last_in_stream && idx == shards.len() - 1`.
+    const bool is_last_shard = (uint16_t)(walked + 1) == (uint16_t)tx_msg.total_data + (uint16_t)tx_msg.parity_count;
+    const bool is_last_in_stream = is_last_shard && tx_last_in_session;
     txSendShard(is_data, idx, is_last_in_stream);
 }
 
